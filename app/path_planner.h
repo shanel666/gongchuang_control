@@ -39,6 +39,7 @@
 
 /* 全局障碍数组：obstacle[i]=1 表示第 i 个点禁止经过（共 25 个网格交点） */
 extern u8 obstacle[25];
+void path_planner_init(void);
 
 /* 调用 path_plan 后，这里存放实际找到的关键点个数（0 = 无路径或参数非法） */
 extern u8 key_point_num;

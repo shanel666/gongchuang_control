@@ -1,4 +1,4 @@
-#include "stm32f10x.h"                  // Device header
+#include "stm32f10x.h"
 #include "Delay.h"
 #include "OLED.h"
 #include "Serial.h"
@@ -6,265 +6,220 @@
 #include "LED.h"
 #include "motor.h"
 #include "path_planner.h"
+#include "path_config.h"
 
-uint8_t KeyNum;			//å®šä¹‰ç”¨äºæ¥æ”¶æŒ‰é”®é”®ç çš„å˜é‡
+static u8 dir = PATH_INITIAL_DIR;
+static u8 judge_display_count = 0;
 
-u8 dir=1;
-u16 x=2250,y=2250;
-
-/*
-	1
-	
-2 		 4
-
-	3
-*/
 #define ABS(x) ((x) < 0 ? -(x) : (x))
-u8 n=0;
 
-void judge(void){
-	u8 judge1=0,judge2=0,judge3=0,judge4=0;
-	while(1){
-		if(judge1==0){
-			Serial_SendByte(0x01);
-			Serial_SendByte(0x3A);
-			Serial_SendByte(0x6B);
-			if(Serial_GetRxFlag()){
-				if(Serial_RxPacket[1]==0x03){//åˆ°è¾¾
-					judge1=1;
-				}
-			}
-		}
-		Delay_ms(5);
-		if(judge2==0){
-			Serial_SendByte(0x02);
-			Serial_SendByte(0x3A);
-			Serial_SendByte(0x6B);
-			if(Serial_GetRxFlag()){
-				if(Serial_RxPacket[1]==0x03){//åˆ°è¾¾
-					judge2=1;
-				}
-			}
-		}
-		Delay_ms(5);
-		if(judge3==0){
-			Serial_SendByte(0x03);
-			Serial_SendByte(0x3A);
-			Serial_SendByte(0x6B);
-			if(Serial_GetRxFlag()){
-				if(Serial_RxPacket[1]==0x03){//åˆ°è¾¾
-					judge3=1;
-				}
-			}
-		}
-		Delay_ms(5);
-		if(judge4==0){
-			Serial_SendByte(0x04);
-			Serial_SendByte(0x3A);
-			Serial_SendByte(0x6B);
-			if(Serial_GetRxFlag()){
-				if(Serial_RxPacket[1]==0x03){//åˆ°è¾¾
-					judge4=1;
-				}
-			}
-		}
-		Delay_ms(5);
-		if(judge1==1&&judge2==1&&judge3==1&&judge4==1){
-			return;
-		}
-		OLED_ShowNum(2,1,n++,5);
-	}
+void judge(void)
+{
+    u8 done1 = 0, done2 = 0, done3 = 0, done4 = 0;
+    u16 t, guard = 0;
+
+    Serial_RxFlag = 0;
+    Serial_RxPacket[0] = Serial_RxPacket[1] = Serial_RxPacket[2] = Serial_RxPacket[3] = 0;
+
+    while(1){
+        OLED_ShowNum(1,1,done1,1);
+        OLED_ShowNum(2,1,done2,1);
+        OLED_ShowNum(3,1,done3,1);
+        OLED_ShowNum(4,1,done4,1);
+
+        if(done1 == 0){
+            Serial_RxFlag = 0;
+            Serial_RxPacket[0]=Serial_RxPacket[1]=Serial_RxPacket[2]=Serial_RxPacket[3]=0;
+            Serial_SendByte(0x01); Serial_SendByte(0x3A); Serial_SendByte(0x6B);
+            t = 0;
+            while(t < 50){ if(Serial_GetRxFlag()) break; Delay_ms(1); t++; }
+            if(Serial_RxPacket[0]==0x01 && Serial_RxPacket[1]==0x3A && Serial_RxPacket[2]==0x03)
+                done1 = 1;
+            Serial_RxFlag = 0;
+        }
+        Delay_ms(5);
+
+        /* done2 / done3 / done4 ÓÃÍ¬ÑùÄ£°å£¬°ÑµØÖ··Ö±ğ»»³É 0x02 / 0x03 / 0x04 */
+
+        if(done1 && done2 && done3 && done4){
+            Serial_RxFlag = 0;
+            return;
+        }
+
+        if(++guard > 400) break;   /* Ç¿ÍË±£»¤ */
+        OLED_ShowNum(1, 3, judge_display_count++, 5);
+    }
 }
-void translation(u16 x0,u16 y0,u16 x1,u16 y1){//0èµ·ç‚¹ 1ç»ˆç‚¹
-	if(x1==x0&&y1>y0){//å‘ä¸Š
-		if(dir==2){//æœå·¦
-			shun_yaw_(90);
-			Delay_ms(1000);
-			judge();
-			dir=1;
-		}
-		if(dir==4){//æœå³
-			ni_yaw_(90);
-			Delay_ms(1000);
-			judge();
-			dir=1;
-		}
-		if(dir==3){
-			houtui_(ABS(y1-y0));
-		}else{
-			qianjin_(ABS(y1-y0));
-		}
-	}else if(x1==x0&&y1<y0){//å‘ä¸‹
-		if(dir==2){//æœå·¦
-			ni_yaw_(90);
-			Delay_ms(1000);
-			judge();
-			dir=3;
-		}
-		if(dir==4){//æœå³
-			shun_yaw_(90);
-			Delay_ms(1000);
-			judge();
-			dir=3;
-		}
-		if(dir==3){
-			qianjin_(ABS(y1-y0));
-		}else{
-//			OLED_ShowChar(4,1,'3');
-			houtui_(ABS(y1-y0));
-//			OLED_ShowChar(4,2,'3');
-		}
-	}else if(x1<x0&&y0==y1){//å‘å·¦
-		if(dir==1){//æœä¸Š
-			ni_yaw_(90);
-			Delay_ms(1000);
-			judge();
-			dir=2;
-		}else if(dir==3){//æœä¸‹
-			shun_yaw_(90);
-			Delay_ms(1000);
-			judge();
-			dir=2;
-		}
-		if(dir==2){
-			qianjin_(ABS(x1-x0));
-		}else{
-			houtui_(ABS(x1-x0));
-		}
-	}else if(x1>x0&&y0==y1){//å‘å³
-		if(dir==1){//æœä¸Š
-			shun_yaw_(90);
-			Delay_ms(1000);
-			judge();
-			dir=4;
-		}
-		if(dir==3){//æœä¸‹
-			ni_yaw_(90);
-			Delay_ms(1000);
-			judge();
-			dir=4;
-		}
-		if(dir==4){
-			qianjin_(ABS(x1-x0));
-		}else{
-			OLED_ShowChar(1,1,'c');
-			houtui_(ABS(x1-x0));
-		}
-	}
-	judge();
+
+static void translation(u16 x0, u16 y0, u16 x1, u16 y1)
+{
+    if(x1 == x0 && y1 > y0){
+        if(dir == 2){ shun_yaw_(90); Delay_ms(1000); judge(); dir = 1; }
+        if(dir == 4){ ni_yaw_(90);   Delay_ms(1000); judge(); dir = 1; }
+        if(dir == 3) houtui_(ABS(y1 - y0));
+        else         qianjin_(ABS(y1 - y0));
+    }else if(x1 == x0 && y1 < y0){
+        if(dir == 2){ ni_yaw_(90);   Delay_ms(1000); judge(); dir = 3; }
+        if(dir == 4){ shun_yaw_(90); Delay_ms(1000); judge(); dir = 3; }
+        if(dir == 3) qianjin_(ABS(y1 - y0));
+        else         houtui_(ABS(y1 - y0));
+    }else if(x1 < x0 && y1 == y0){
+        if(dir == 1){ ni_yaw_(90); Delay_ms(1000); judge(); dir = 2; }
+        else if(dir == 3){ shun_yaw_(90); Delay_ms(1000); judge(); dir = 2; }
+        if(dir == 2) qianjin_(ABS(x1 - x0));
+        else         houtui_(ABS(x1 - x0));
+    }else if(x1 > x0 && y1 == y0){
+        if(dir == 1){ shun_yaw_(90); Delay_ms(1000); judge(); dir = 4; }
+        if(dir == 3){ ni_yaw_(90);   Delay_ms(1000); judge(); dir = 4; }
+        if(dir == 4) qianjin_(ABS(x1 - x0));
+        else         houtui_(ABS(x1 - x0));
+    }
+
+    judge();
 }
+void judge_yaw(void)
+{
+    u8 done1 = 0, done2 = 0;
+    u16 t, guard = 0;
+
+    Serial_RxFlag = 0;
+    Serial_RxPacket[0] = Serial_RxPacket[1] = Serial_RxPacket[2] = Serial_RxPacket[3] = 0;
+
+    while(!(done1 && done2)){
+        OLED_ShowNum(1,1,done1,1);
+        OLED_ShowNum(2,1,done2,1);
+        OLED_ShowHexNum(3,1, Serial_RxPacket[0], 2);
+        OLED_ShowHexNum(3,4, Serial_RxPacket[1], 2);
+        OLED_ShowHexNum(3,7, Serial_RxPacket[2], 2);
+        OLED_ShowHexNum(3,10,Serial_RxPacket[3], 2);
+
+        if(done1 == 0){
+            Serial_RxFlag = 0;
+            Serial_RxPacket[0]=Serial_RxPacket[1]=Serial_RxPacket[2]=Serial_RxPacket[3]=0;
+            Serial_SendByte(0x01); Serial_SendByte(0x3A); Serial_SendByte(0x6B);
+            t = 0;
+            while(t < 50){ if(Serial_GetRxFlag()) break; Delay_ms(1); t++; }
+            if(Serial_RxPacket[0]==0x01 && Serial_RxPacket[1]==0x3A && Serial_RxPacket[2]==0x03)
+                done1 = 1;
+            Serial_RxFlag = 0;
+        }
+        Delay_ms(5);
+
+        if(done2 == 0){
+            Serial_RxFlag = 0;
+            Serial_RxPacket[0]=Serial_RxPacket[1]=Serial_RxPacket[2]=Serial_RxPacket[3]=0;
+            Serial_SendByte(0x02); Serial_SendByte(0x3A); Serial_SendByte(0x6B);
+            t = 0;
+            while(t < 50){ if(Serial_GetRxFlag()) break; Delay_ms(1); t++; }
+            if(Serial_RxPacket[0]==0x02 && Serial_RxPacket[1]==0x3A && Serial_RxPacket[2]==0x03)
+                done2 = 1;
+            Serial_RxFlag = 0;
+        }
+        Delay_ms(5);
+
+        if(++guard > 400) break;   /* ´óÔ¼ 44s Ç¿ÍË£¬·ÀÖ¹ËÀÑ­»· */
+    }
+}
+
+/* ¡ª¡ª ±ê¶¨ ¡ª¡ª */
+#define PULSE_PER_100CM  12658u   /* Æ½ÒÆ±ê¶¨£º12658 Âö³å = 100 cm£¨ÒÑ±ê¶¨£© */
+#define PULSE_PER_360DEG    16028u     /* Ğı×ª±ê¶¨£ºÃ¿¶ÈÂö³åÊı ¡ª¡ª TODO ´ı±ê¶¨£¡µ±Ç°ÎªÕ¼Î»Öµ 360¶È 15800*/
+
+/* ËÙ¶È / ¼ÓËÙ¶È£¨¿Éµ÷£© */
+#define MOTOR_SPEED      50    /* ËÙ¶È 0x07D0£»ÉÏÎ»»úÄ¬ÈÏ 200 ÒÑ½Ï¿ì */
+#define MOTOR_ACCEL      200     /* ¼ÓËÙ¶È 0x64 */
+#define MOTOR_SPEED_H    ((uint8_t)(MOTOR_SPEED >> 8))   /* ËÙ¶È¸ß×Ö½Ú */
+#define MOTOR_SPEED_L    ((uint8_t)(MOTOR_SPEED & 0xFF)) /* ËÙ¶ÈµÍ×Ö½Ú */
+
 int main(void)
 {
-	LED_Init();//PA1,2
-	/*æ¨¡å—åˆå§‹åŒ–*/
-	OLED_Init();		//OLEDåˆå§‹åŒ–
-	Key_Init();			//æŒ‰é”®åˆå§‹åŒ–
-	Serial_Init();		//ä¸²å£åˆå§‹åŒ–
-	
-	Delay_ms(1000);
-//	shun_yaw_(90);
-//	OLED_ShowChar(1,1,'z');
-	translation(2250,2250,1200,2250);
-	Delay_ms(3000);
-	translation(2250,2250,2250,1200);
-	while(1){
-	
-	}
-	u16 xpath[16];
-	u16 ypath[16];
-	path_plan(2250,2250,1200,150,16,xpath,ypath);
-	for(int i=0;i<key_point_num;i++){
-		OLED_ShowNum(i+1,1,xpath[i],4);
-		OLED_ShowNum(i+1,6,ypath[i],4);
-	}
-//	OLED_ShowNum(1,1,key_point_num,2);
-	while(1){}
-	
-	OLED_ShowChar(1,1,'z');
-	Delay_ms(1000);
-	
-	qianjin_(1200);
-	Delay_ms(3000);
-	houtui_(1200);
-	while(1){}
-	
-	
-	u16 x0=150,y0=2250;
-		
-	
+    u16 xpath[MAX_KEY_POINTS];
+    u16 ypath[MAX_KEY_POINTS];
+    u8 i;
+
+    LED_Init();
+    OLED_Init();
+    Key_Init();
+    Serial_Init();
+    Delay_ms(1000);
 
 	
-	
-	while(1){}
-	//æ ‡å®šï¼šæœ€æ—©éº¦è½®10000è„‰å†²79cmï¼Œ12658è„‰å†²100cm
-//	qianjin_(600);
-//	Delay_ms(4000);
-//	houtui_(600);
-//	Delay_ms(4000);
-	shun_yaw_(90);
-	Delay_ms(2000);
-	shun_yaw_(90);
-	Delay_ms(2000);
-	shun_yaw_(90);
-	Delay_ms(2000);
-	shun_yaw_(90);
-	Delay_ms(2000);
-//	zuo_yaw_(90);
-//	Delay_ms(4000);
-//	zuo_(100);
-//	Delay_ms(4000);
-//	you_(100);
-//	Delay_ms(3000);
-	
-	while(1){
-		
-	}
-	
-	while(1){
-		qianjin_(80);
-		Delay_ms(3000);
-		zuo_(80);
-		Delay_ms(3000);
-		houtui_(80);
-		Delay_ms(3000);
-		you_(80);
-		Delay_ms(3000);
-	}
+//	uint32_t p = 600 * PULSE_PER_100CM / 1000u;   /* Âö³åÊı */
+//    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
-	/*æ˜¾ç¤ºé™æ€å­—ç¬¦ä¸²*/
-	OLED_ShowString(1, 1, "TxPacket");
-	OLED_ShowString(3, 1, "RxPacket");
-	
-	/*è®¾ç½®å‘é€æ•°æ®åŒ…æ•°ç»„çš„åˆå§‹å€¼ï¼Œç”¨äºæµ‹è¯•*/
-	Serial_TxPacket[0] = 0x01;
-	Serial_TxPacket[1] = 0x02;
-	Serial_TxPacket[2] = 0x03;
-	Serial_TxPacket[3] = 0x04;
-	
-	while (1)
-	{
-		KeyNum = Key_GetNum();			//è·å–æŒ‰é”®é”®ç 
-		if (KeyNum == 1)				//æŒ‰é”®1æŒ‰ä¸‹
-		{
-			Serial_TxPacket[0] ++;		//æµ‹è¯•æ•°æ®è‡ªå¢
-			Serial_TxPacket[1] ++;
-			Serial_TxPacket[2] ++;
-			Serial_TxPacket[3] ++;
-			
-			Serial_SendPacket();		//ä¸²å£å‘é€æ•°æ®åŒ…Serial_TxPacket
-			
-			OLED_ShowHexNum(2, 1, Serial_TxPacket[0], 2);	//æ˜¾ç¤ºå‘é€çš„æ•°æ®åŒ…
-			OLED_ShowHexNum(2, 4, Serial_TxPacket[1], 2);
-			OLED_ShowHexNum(2, 7, Serial_TxPacket[2], 2);
-			OLED_ShowHexNum(2, 10, Serial_TxPacket[3], 2);
-		}
+//    cmd[6] = (uint8_t)(p >> 24);
+//    cmd[7] = (uint8_t)(p >> 16);
+//    cmd[8] = (uint8_t)(p >> 8);
+//    cmd[9] = (uint8_t)p;
+
+//    cmd[0] = 0x01; cmd[2] = 0x00;   /* FL Õı×ª */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
+//    cmd[0] = 0x02; cmd[2] = 0x01;   /* FR ·´×ª£¨¾µÏñ£© */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
+//    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL Õı×ª */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
+//    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR ·´×ª£¨¾µÏñ£© */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
+
+//    /* Í¬²½ÊÍ·Å£ºÖ±ĞĞ sync=0x01£¬´ËÖ¡ÈÃ 4 ¸öµç»úÍ¬Ê±Æğ²½ */
+//    Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
+//	Delay_ms(5);
+//	judge();
+//	while(1){}
+
+//    uint32_t p = 90 *PULSE_PER_360DEG/360u;
+//    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+
+//    cmd[6] = (uint8_t)(p >> 24);
+//    cmd[7] = (uint8_t)(p >> 16);
+//    cmd[8] = (uint8_t)(p >> 8);
+//    cmd[9] = (uint8_t)p;
+
+//    cmd[0] = 0x01; cmd[2] = 0x00;   /* FL */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
+//    cmd[0] = 0x02; cmd[2] = 0x00;   /* FR */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
+////    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL */
+////    Serial_SendArray(cmd, 13); Delay_ms(5);
+////    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR */
+////    Serial_SendArray(cmd, 13); Delay_ms(5);
+
+//    Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
+//	Delay_ms(5);
+//	judge();
+//	while(1){}
 		
-		if (Serial_GetRxFlag() == 1)	//å¦‚æœæ¥æ”¶åˆ°æ•°æ®åŒ…
-		{
-			OLED_ShowHexNum(4, 1, Serial_RxPacket[0], 2);	//æ˜¾ç¤ºæ¥æ”¶çš„æ•°æ®åŒ…
-			OLED_ShowHexNum(4, 4, Serial_RxPacket[1], 2);
-			OLED_ShowHexNum(4, 7, Serial_RxPacket[2], 2);
-			OLED_ShowHexNum(4, 10, Serial_RxPacket[3], 2);
-		}
-	}
+		
+	
+    shun_yaw_(90);
+    judge_yaw();
+	Delay_ms(500);
+    houtui_(600);
+    judge();
+    Delay_ms(500);
+    shun_yaw_(90);
+    judge_yaw();
+    Delay_ms(500);
+    qianjin_(600);
+    judge();
+	while(1){}
+		
+		
+    path_planner_init();
+    path_plan(PATH_START_X, PATH_START_Y, PATH_TARGET_X, PATH_TARGET_Y,
+              MAX_KEY_POINTS, xpath, ypath);
+
+    if(key_point_num == 0){
+        OLED_ShowString(1, 1, "PATH ERROR");
+        while(1){}
+    }
+
+    motor_enable_all();
+
+    for(i = 1; i < key_point_num; i++){
+        translation(xpath[i - 1], ypath[i - 1], xpath[i], ypath[i]);
+    }
+
+    OLED_ShowString(1, 1, "PATH DONE");
+    while(1){}
 }

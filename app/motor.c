@@ -12,7 +12,7 @@
 #define PULSE_PER_360DEG    16028u     /* 旋转标定：每度脉冲数 —— TODO 待标定！当前为占位值 360度 15800*/
 
 /* 速度 / 加速度（可调） */
-#define MOTOR_SPEED      150    /* 速度 0x07D0；上位机默认 200 已较快 */
+#define MOTOR_SPEED      50    /* 速度 0x07D0；上位机默认 200 已较快 */
 #define MOTOR_ACCEL      200     /* 加速度 0x64 */
 #define MOTOR_SPEED_H    ((uint8_t)(MOTOR_SPEED >> 8))   /* 速度高字节 */
 #define MOTOR_SPEED_L    ((uint8_t)(MOTOR_SPEED & 0xFF)) /* 速度低字节 */
@@ -134,14 +134,14 @@ void shun_yaw_(uint32_t deg)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-//    cmd[0] = 0x01; cmd[2] = 0x00;   /* FL */
-//    Serial_SendArray(cmd, 13); Delay_ms(50);
-//    cmd[0] = 0x02; cmd[2] = 0x00;   /* FR */
-//    Serial_SendArray(cmd, 13); Delay_ms(50);
-    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL */
+    cmd[0] = 0x01; cmd[2] = 0x00;   /* FL */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR */
+    cmd[0] = 0x02; cmd[2] = 0x00;   /* FR */
     Serial_SendArray(cmd, 13); Delay_ms(5);
+//    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
+//    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
 
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
 	Delay_ms(5);
@@ -158,14 +158,14 @@ void ni_yaw_(uint32_t deg)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-//    cmd[0] = 0x01; cmd[2] = 0x01;   /* FL */
-//    Serial_SendArray(cmd, 13); Delay_ms(50);
-//    cmd[0] = 0x02; cmd[2] = 0x01;   /* FR */
-//    Serial_SendArray(cmd, 13); Delay_ms(50);
-    cmd[0] = 0x03; cmd[2] = 0x01;   /* RL */
+    cmd[0] = 0x01; cmd[2] = 0x01;   /* FL */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR */
+    cmd[0] = 0x02; cmd[2] = 0x01;   /* FR */
     Serial_SendArray(cmd, 13); Delay_ms(5);
+//    cmd[0] = 0x03; cmd[2] = 0x01;   /* RL */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
+//    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR */
+//    Serial_SendArray(cmd, 13); Delay_ms(5);
 
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
 	Delay_ms(5);

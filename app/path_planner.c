@@ -1,4 +1,5 @@
 #include "path_planner.h"
+#include "path_config.h"
 
 
 /* ----------------------------------------------------------------------------
@@ -47,13 +48,7 @@ static const u16 NODE_Y[25] = {
  * 想再禁止别的点，就把对应位置改成 1（例如把点 2 也禁止：obstacle[2]=1;）。
  * ----------------------------------------------------------------------------
  */
-u8 obstacle[25] = {
-    0, 0, 0, 0, 0,
-    0, 1, 0, 1, 0,
-    0, 0, 0, 0, 0,
-    0, 1, 0, 1, 0,
-    0, 0, 0, 0, 0
-};
+u8 obstacle[25] = {0};
 
 /* 调用 path_plan 后，这里存放实际找到的关键点个数 */
 u8 key_point_num = 0;
@@ -64,6 +59,41 @@ static int find_node(u16 x, u16 y){
     for(i = 0; i < 25; i++)
         if(NODE_X[i] == x && NODE_Y[i] == y) return i;
     return -1;
+}
+
+static void mark_obstacle(u16 x, u16 y){
+    int node = find_node(x, y);
+    if(node >= 0) obstacle[node] = 1;
+}
+
+void path_planner_init(void){
+    int i;
+    for(i = 0; i < 25; i++) obstacle[i] = 0;
+
+#if PATH_OBSTACLE_COUNT > 0
+    mark_obstacle(PATH_OBSTACLE_0_X, PATH_OBSTACLE_0_Y);
+#endif
+#if PATH_OBSTACLE_COUNT > 1
+    mark_obstacle(PATH_OBSTACLE_1_X, PATH_OBSTACLE_1_Y);
+#endif
+#if PATH_OBSTACLE_COUNT > 2
+    mark_obstacle(PATH_OBSTACLE_2_X, PATH_OBSTACLE_2_Y);
+#endif
+#if PATH_OBSTACLE_COUNT > 3
+    mark_obstacle(PATH_OBSTACLE_3_X, PATH_OBSTACLE_3_Y);
+#endif
+#if PATH_OBSTACLE_COUNT > 4
+    mark_obstacle(PATH_OBSTACLE_4_X, PATH_OBSTACLE_4_Y);
+#endif
+#if PATH_OBSTACLE_COUNT > 5
+    mark_obstacle(PATH_OBSTACLE_5_X, PATH_OBSTACLE_5_Y);
+#endif
+#if PATH_OBSTACLE_COUNT > 6
+    mark_obstacle(PATH_OBSTACLE_6_X, PATH_OBSTACLE_6_Y);
+#endif
+#if PATH_OBSTACLE_COUNT > 7
+    mark_obstacle(PATH_OBSTACLE_7_X, PATH_OBSTACLE_7_Y);
+#endif
 }
 
 /* Dijkstra 最短路（每条边权 1），跳过障碍点 */
@@ -108,6 +138,8 @@ void path_plan(u16 x0, u16 y0, u16 x1, u16 y1, u8 n, u16 *xpath, u16 *ypath){
 
     key_point_num = 0;
 
+    if(n == 0 || xpath == 0 || ypath == 0) return;
+
     src = find_node(x0, y0);
     dst = find_node(x1, y1);
     if(src < 0 || dst < 0) return;                 /* 坐标不对应任何网格点 */
@@ -133,6 +165,9 @@ void path_plan(u16 x0, u16 y0, u16 x1, u16 y1, u8 n, u16 *xpath, u16 *ypath){
         if(d1 != d2) tp[tlen++] = path[i];                 /* 方向变了 → 拐弯点 */
     }
     if(plen > 1) tp[tlen++] = path[plen - 1];
+
+    /* Do not write a partial route into a caller-provided buffer. */
+    if(tlen > n) return;
 
     /* 写入输出（不超过容量 n） */
     for(i = 0; i < tlen; i++){

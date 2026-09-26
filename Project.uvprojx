@@ -778,6 +778,11 @@
               <FileType>5</FileType>
               <FilePath>.\app\path_planner.h</FilePath>
             </File>
+            <File>
+              <FileName>path_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\path_config.h</FilePath>
+            </File>
           </Files>
         </Group>
       </Groups>
@@ -1553,6 +1558,11 @@
               <FileName>path_planner.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\app\path_planner.h</FilePath>
+            </File>
+            <File>
+              <FileName>path_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\path_config.h</FilePath>
             </File>
           </Files>
         </Group>
