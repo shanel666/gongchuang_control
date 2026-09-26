@@ -8,8 +8,8 @@
  */
 
 /* —— 标定 —— */
-#define PULSE_PER_100CM  12658u   /* 平移标定：12658 脉冲 = 100 cm（已标定） */
-#define PULSE_PER_360DEG    16028u     /* 旋转标定：每度脉冲数 —— TODO 待标定！当前为占位值 360度 15800*/
+#define PULSE_PER_100CM  13008u   /* 平移标定：12658 脉冲 = 100 cm（已标定） */
+#define PULSE_PER_360DEG    17208u     /* 旋转标定：每度脉冲数 —— TODO 待标定！当前为占位值 360度 15800*/
 
 /* 速度 / 加速度（可调） */
 #define MOTOR_SPEED      50    /* 速度 0x07D0；上位机默认 200 已较快 */
@@ -37,13 +37,13 @@ void qianjin_(uint32_t mm)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-    cmd[0] = 0x01; cmd[2] = 0x00;   /* FL 正转 */
+    cmd[0] = 0x01; cmd[2] = 0x01;   /* FL 正转 */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x02; cmd[2] = 0x01;   /* FR 反转（镜像） */
+    cmd[0] = 0x02; cmd[2] = 0x00;   /* FR 反转（镜像） */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL 正转 */
+    cmd[0] = 0x03; cmd[2] = 0x01;   /* RL 正转 */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR 反转（镜像） */
+    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR 反转（镜像） */
     Serial_SendArray(cmd, 13); Delay_ms(5);
 
     /* 同步释放：直行 sync=0x01，此帧让 4 个电机同时起步 */
@@ -62,13 +62,13 @@ void houtui_(uint32_t mm)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-    cmd[0] = 0x01; cmd[2] = 0x01;   /* FL 反转 */
+    cmd[0] = 0x01; cmd[2] = 0x00;   /* FL 反转 */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x02; cmd[2] = 0x00;   /* FR 正转（镜像） */
+    cmd[0] = 0x02; cmd[2] = 0x01;   /* FR 正转（镜像） */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x01;   /* RL 反转 */
+    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL 反转 */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR 正转（镜像） */
+    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR 正转（镜像） */
     Serial_SendArray(cmd, 13); Delay_ms(5);
 
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
