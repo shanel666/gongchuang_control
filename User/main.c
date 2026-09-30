@@ -121,8 +121,6 @@ void judge_yaw(void)
     }
 }
 
-
-
 int main(void)
 {
     u16 xpath[MAX_KEY_POINTS];
@@ -133,11 +131,105 @@ int main(void)
     OLED_Init();
     Key_Init();
     Serial_Init();
-    Delay_ms(1000);
-	u8 key_num=0;
+	USART2_Init(115200);
+    Delay_ms(200);
+
+	
+//	while (1)
+//	{
+//		USART2_SendByte('A');        // 0x41
+//		USART2_SendByte('B');        // 0x42
+//		USART2_SendByte('\r');
+//		USART2_SendByte('\n');
+//		Delay_ms(500);
+//		PC13_Turn();
+//	}
+	uint16_t print_cnt = 0;   // 打印分频计数
+
+	USART2_SendByte(0x33);
+	
+	while (1)
+	{
+		uint8_t key = 0;
+
+		/* 每约 500ms 通过 USART2 打印一次状态 */
+		if (++print_cnt >= 500)
+		{
+			/*
+				int32_t pos_now    = 0;   // 电机当前位置（从串口读回）
+				int32_t pos_memo   = 0;   // 记住的位置
+				uint8_t pos_dir    = 0;   // 方向位暂存
+			*/
+			print_cnt = 0;
+
+			USART2_SendString(" now=");
+			USART2_SendInt(pos_now);
+			USART2_SendString(" memo=");
+			USART2_SendInt(pos_memo);
+			USART2_SendString(" dir=");
+			USART2_SendDec(pos_dir);
+			USART2_SendString("\r\n");
+		}
+		Delay_ms(1);
+		
+
+		/* 串口2模拟按键 */
+		if (uart_key_num != 0)
+		{
+			key = uart_key_num;
+			uart_key_num = 0;              // 消费掉
+		}
+
+		if (key != 0)
+		{
+			if (key == 1)
+			{
+				motor_read_pos();       // 内部更新 pos_now 和 pos_dir
+				pos_memo = pos_now;     // ★ 记忆当前位置
+			}
+			else if (key == 2)
+			{
+				motor_set_pos(pos_memo);
+			}
+			else if (key == 3)
+			{
+				pos_memo += 160;         // 基于记忆位置微调
+			}
+			else if (key == 4)
+			{
+				pos_memo -= 160;
+			}
+		}
+	}	
 	
 	
-	u16 pulse_600mm=12658u;
+//	u8 key_num=0;
+//	u32 now_compsition=0;
+//	uint8_t cmd[13] = {0x00, 0xFD, 0x00, 0x11, 0x94, 0xc8,0x01, 
+//						now_compsition>>24,now_compsition>>16, now_compsition>>8, now_compsition, 0x00, 0x6B};
+//	
+//	while(1) {
+//		uint8_t key_num = Key_GetNum();
+//		if (key_num != 0) {
+//			if(key_num==1){
+//				
+//				Serial_SendByte(0x01); Serial_SendByte(0x36); Serial_SendByte(0x6B);
+//				while(!uart_get){
+//					now_compsition=compsition_buffer[0]<<24||compsition_buffer[1]<<16||\
+//					compsition_buffer[0]<<8||compsition_buffer[0];
+//					continue;
+//				}
+//			}else if(key_num==2){
+//				Serial_SendArray(cmd, 13);
+//			}else if(key_num==3){
+//				now_compsition+=1000;
+//			}
+//		}
+//		OLED_ShowNum(1, 1, key_num, 1);
+//		OLED_ShowHexNum(2, 1, now_compsition, 1);
+//	}
+	
+//	u16 pulse_600mm=12658u;
 //	uint8_t last_key = 0;
 //	while(1) {
 //		uint8_t key_num = Key_GetNum();
@@ -149,7 +241,8 @@ int main(void)
 //				pulse_600mm-=10;	
 //			}else if(key_num==3){
 //				uint32_t p = 600 * pulse_600mm / 1000u;   /* 脉冲数 */
-//				uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+//				uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL,
+//									0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
 //				cmd[6] = (uint8_t)(p >> 24);
 //				cmd[7] = (uint8_t)(p >> 16);

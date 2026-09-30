@@ -45,7 +45,7 @@ uint8_t Key_GetNum(void)
 		KeyNum = 2;												//置键码为2
 	}
 	
-	if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_10) == 0)			//读PB11输入寄存器的状态，如果为0，则代表按键2按下
+	if (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_10) == 0)			//读PB10输入寄存器的状态，如果为0，则代表按键2按下
 	{
 		Delay_ms(20);											//延时消抖
 		while (GPIO_ReadInputDataBit(GPIOB, GPIO_Pin_10) == 0);	//等待按键松手

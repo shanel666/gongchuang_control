@@ -8,6 +8,7 @@ void LED1_Turn(void);
 void LED2_ON(void);
 void LED2_OFF(void);
 void LED2_Turn(void);
-void PA1_pulse(void);
-
+void PC13_pulse(void);
+void PC13_Turn(void);
+	
 #endif

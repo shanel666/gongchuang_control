@@ -17,4 +17,14 @@ void Serial_Printf(char *format, ...);
 void Serial_SendPacket(void);
 uint8_t Serial_GetRxFlag(void);
 
+void USART2_SendByte(uint8_t byte);
+void USART2_Init(uint32_t bound);
+/* Serial2.h */
+extern volatile uint8_t uart_key_num;
+void USART2_SendString(char *s);
+void USART2_SendHex32(uint32_t val);
+void USART2_SendDec(uint32_t val);
+void USART2_SendInt(int32_t v);
+
+
 #endif

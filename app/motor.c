@@ -185,3 +185,73 @@ void motor_enable_all(void)
         Delay_ms(5);
     }
 }
+volatile uint8_t uart_key_num = 0;
+int32_t  pos_now  = 0;    // 电机当前位置（有符号）
+int32_t  pos_memo = 0;    // 记忆位置（有符号）
+uint8_t  pos_dir  = 0;    // 方向位暂存
+void motor_read_pos(void)
+{
+    Serial_SendByte(0x01);
+    Serial_SendByte(0x36);
+    Serial_SendByte(0x6B);
+
+    Serial_RxFlag = 0;
+    uint32_t timeout = 200000;
+    while (Serial_RxFlag == 0 && timeout > 0) timeout--;
+
+    if (Serial_RxFlag &&
+        Serial_RxPacket[0] == 0x01 &&
+        Serial_RxPacket[1] == 0x36 &&
+        Serial_RxPacket[7] == 0x6B)
+    {
+        pos_dir = Serial_RxPacket[2];
+
+        uint32_t p = ((uint32_t)Serial_RxPacket[3] << 24) |
+                     ((uint32_t)Serial_RxPacket[4] << 16) |
+                     ((uint32_t)Serial_RxPacket[5] << 8)  |
+                     ((uint32_t)Serial_RxPacket[6]);
+
+        /* 方向位 0x01 代表负，就转成负数 */
+        if (pos_dir == 0x01)
+            pos_now = -(int32_t)p;
+        else
+            pos_now =  (int32_t)p;
+    }
+    Serial_RxFlag = 0;
+}
+
+uint8_t cmd[13] = {
+    0x01,                       // [0] 地址（原来是 0x00，改成 0x01）
+    0xFD,                       // [1] 命令
+    0x00,                       // [2] 方向，运行时覆盖
+    0x00, 0x64,                 // [3][4] 速度 = 0x1194 = 4500
+    0xC8,                       // [5] 加速度 = 200
+    0x00, 0x00, 0x00, 0x00,     // [6..9] 位置，运行时覆盖
+    0x01,                       // [10] 绝对位置模式
+    0x00,                       // [11] 保留
+    0x6B                        // [12] 尾部
+};
+void motor_set_pos(int32_t pos)
+{
+    uint32_t absp;
+    uint8_t  dir;
+
+    if (pos < 0)
+    {
+        dir  = 0x01;              // 负数方向
+        absp = (uint32_t)(-pos);  // 绝对值
+    }
+    else
+    {
+        dir  = 0x00;              // 正数方向
+        absp = (uint32_t)pos;
+    }
+
+    cmd[2] = dir;
+    cmd[6] = (uint8_t)(absp >> 24);
+    cmd[7] = (uint8_t)(absp >> 16);
+    cmd[8] = (uint8_t)(absp >> 8);
+    cmd[9] = (uint8_t)(absp);
+
+    Serial_SendArray(cmd, 13);
+}

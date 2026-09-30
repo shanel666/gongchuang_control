@@ -25,5 +25,12 @@ void ni_yaw_(uint32_t deg);
 
 /* 使能 4 个电机：上电默认失能，移动前先调一次 */
 void motor_enable_all(void);
+extern volatile uint8_t uart_key_num;
+extern int32_t  pos_now;    // 电机当前位置（有符号）
+extern int32_t  pos_memo;    // 记忆位置（有符号）
+extern uint8_t  pos_dir;    // 方向位暂存
+void motor_read_pos(void);
 
+extern uint8_t cmd[13];
+void motor_set_pos(int32_t pos);
 #endif /* __MOTOR_H */

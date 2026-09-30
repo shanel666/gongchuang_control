@@ -2,9 +2,9 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-uint8_t Serial_TxPacket[4];				//定义发送数据包数组，数据包格式：FF 01 02 03 04 FE
-uint8_t Serial_RxPacket[4];				//定义接收数据包数组
-uint8_t Serial_RxFlag;					//定义接收数据包标志位
+volatile uint8_t Serial_TxPacket[4];				//定义发送数据包数组，数据包格式：FF 01 02 03 04 FE
+volatile uint8_t Serial_RxPacket[16];				//定义接收数据包数组
+volatile uint8_t Serial_RxFlag;					//定义接收数据包标志位
 
 /**
   * 函    数：串口初始化
@@ -194,33 +194,197 @@ void USART1_IRQHandler(void)
 {
     static uint8_t RxState = 0;
     static uint8_t pRxPacket = 0;
+    static uint8_t frame_len = 4;   // 默认短帧长度
+
     if (USART_GetITStatus(USART1, USART_IT_RXNE) == SET)
     {
         uint8_t RxData = USART_ReceiveData(USART1);
 
         if (RxState == 0)
         {
-            /* 地址 0x01~0x04 作为帧头 */
+            /* 帧头 0x01~0x04 */
             if (RxData >= 0x01 && RxData <= 0x04)
             {
                 Serial_RxPacket[0] = RxData;
                 pRxPacket = 1;
+                frame_len = 4;      // 默认按短帧处理
                 RxState = 1;
             }
         }
         else if (RxState == 1)
         {
             Serial_RxPacket[pRxPacket++] = RxData;
-            if (pRxPacket >= 4)
+
+            /* 收到第 2 个字节后判断是否为长帧：01 36 ... */
+            if (pRxPacket == 2)
+            {
+                if (Serial_RxPacket[0] == 0x01 && Serial_RxPacket[1] == 0x36)
+                {
+                    frame_len = 8;  // 长帧：01 36 00/01 + 4字节位置 + 6B
+                }
+                else
+                {
+                    frame_len = 4;  // 原短帧
+                }
+            }
+
+            if (pRxPacket >= frame_len)
             {
                 RxState = 0;
-                if (Serial_RxPacket[3] == 0x6B)   /* 尾校验 */
+                /* 检查最后一个字节是否为 0x6B */
+                if (Serial_RxPacket[frame_len - 1] == 0x6B)
                 {
-                    Serial_RxFlag = 1;
+                    Serial_RxFlag = 1;   // 接收完成标志
                 }
+                // 注意：pRxPacket 会在下次收到帧头时重置为 1
             }
         }
 
         USART_ClearITPendingBit(USART1, USART_IT_RXNE);
     }
+}
+#define USART2_RX_BUF_SIZE  16
+uint8_t Serial2_RxPacket[USART2_RX_BUF_SIZE];
+volatile uint8_t Serial2_RxFlag = 0;
+void USART2_Init(uint32_t bound)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+    USART_InitTypeDef USART_InitStructure;
+    NVIC_InitTypeDef NVIC_InitStructure;
+
+    /* 使能时钟：GPIOA 在 APB2，USART2 在 APB1 */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
+
+    /* PA2 - USART2_TX 复用推挽输出 */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+    /* PA3 - USART2_RX 浮空输入（或上拉输入） */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+    /* USART2 参数配置 */
+    USART_InitStructure.USART_BaudRate = bound;
+    USART_InitStructure.USART_WordLength = USART_WordLength_8b;
+    USART_InitStructure.USART_StopBits = USART_StopBits_1;
+    USART_InitStructure.USART_Parity = USART_Parity_No;
+    USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
+    USART_Init(USART2, &USART_InitStructure);
+
+    /* 开启 USART2 接收中断 */
+    USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
+
+    /* NVIC 配置 */
+    NVIC_InitStructure.NVIC_IRQChannel = USART2_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
+    /* 使能 USART2 */
+    USART_Cmd(USART2, ENABLE);
+}
+
+void USART2_SendByte(uint8_t byte)
+{
+    USART_SendData(USART2, byte);
+    while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);
+}
+/* USART2 模拟按键：收到 k:1 / k:2 / k:3 时置位 */
+#include "motor.h"
+void USART2_IRQHandler(void)
+{
+    static uint8_t state = 0;
+    static uint8_t digit = 0;
+
+    if (USART_GetITStatus(USART2, USART_IT_RXNE) == SET)
+    {
+        uint8_t ch = USART_ReceiveData(USART2);
+		USART2_SendByte(ch);
+        switch (state)
+        {
+            case 0:
+                if (ch == 'k') state = 1;
+                break;
+            case 1:
+                if (ch == ':') { state = 2; digit = 0; }
+                else state = 0;
+                break;
+            case 2:
+                if (ch >= '0' && ch <= '9')
+                {
+                    digit = digit * 10 + (ch - '0');
+                }
+                else if (ch == '\n' || ch == '\r')
+                {
+                    if (digit != 0) uart_key_num = digit;
+                    state = 0;
+                }
+                else
+                {
+                    state = 0;   // 其他字符，放弃
+                }
+                break;
+        }
+        USART_ClearITPendingBit(USART2, USART_IT_RXNE);
+    }
+}
+
+
+void USART2_SendArray(uint8_t *array, uint16_t len)
+{
+    for (uint16_t i = 0; i < len; i++)
+    {
+        USART2_SendByte(array[i]);
+    }
+}
+
+
+void USART2_SendString(char *s)
+{
+    while (*s)
+    {
+        USART2_SendByte((uint8_t)*s++);
+    }
+}
+
+void USART2_SendHex32(uint32_t val)
+{
+    const char hex[] = "0123456789ABCDEF";
+    for (int i = 28; i >= 0; i -= 4)
+    {
+        USART2_SendByte(hex[(val >> i) & 0x0F]);
+    }
+}
+
+void USART2_SendDec(uint32_t val)
+{
+    char buf[12];
+    int i = 0;
+    if (val == 0)
+    {
+        USART2_SendByte('0');
+        return;
+    }
+    while (val > 0)
+    {
+        buf[i++] = '0' + (val % 10);
+        val /= 10;
+    }
+    while (i > 0) USART2_SendByte(buf[--i]);
+}
+
+void USART2_SendInt(int32_t v)
+{
+    if (v < 0)
+    {
+        USART2_SendByte('-');
+        v = -v;
+    }
+    USART2_SendDec((uint32_t)v);
 }
