@@ -11,13 +11,13 @@
  * 平移标定：12658 脉冲 = 100 cm
  */
 
-/* 前进 / 后退：参数 = 距离 cm */
-void qianjin_(uint32_t cm);
-void houtui_(uint32_t cm);
+/* 前进 / 后退：参数 = 距离 mm */
+void qianjin_(uint32_t mm);
+void houtui_(uint32_t mm);
 
-/* 左右平移：参数 = 距离 cm */
-void zuo_(uint32_t deg);
-void you_(uint32_t deg);
+/* 左右平移：参数 = 距离 mm */
+void zuo_(uint32_t mm);
+void you_(uint32_t mm);
 
 /* 左转（逆时针）/ 右转（顺时针）：参数 = 角度 度；每度脉冲见 motor.c 的 PULSE_PER_DEG */
 void shun_yaw_(uint32_t deg);

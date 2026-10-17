@@ -8,8 +8,15 @@
  */
 
 /* —— 标定 —— */
-#define PULSE_PER_100CM  13008u   /* 平移标定：12658 脉冲 = 100 cm（已标定） */
-#define PULSE_PER_360DEG    17208u     /* 旋转标定：每度脉冲数 —— TODO 待标定！当前为占位值 360度 15800*/
+#define PULSE_PER_100CM  13008u   /** 平移标定：13008u 脉冲 = 100 cm（已标定）
+                                    * 左右平移会稍短，每 100cm 约少 5 cm
+                                    */
+#define PULSE_PER_360DEG    18373u     /** 旋转标定：18373u 脉冲 = 360°（10月16日）
+                                         * 开环旋转必然打滑，此标定与地面性质有关，经过实测：
+                                         * 实验室大理石地面上：18373u 脉冲 = 361.4°
+                                         * 实验室场地白布上：18373u 脉冲 = 358.9°
+                                         * 结论：场地越粗糙，阻力大，不同轮之间打滑差异越大，旋转角度越小
+                                         */
 
 /* 速度 / 加速度（可调） */
 #define MOTOR_SPEED      70    /* 速度 0x07D0；上位机默认 200 已较快 */
@@ -94,9 +101,9 @@ void zuo_(uint32_t mm)
     Serial_SendArray(cmd, 13); Delay_ms(5);
     cmd[0] = 0x02; cmd[2] = 0x01;   /* FR */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x01;   /* RL */
+    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR */
+    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR */
     Serial_SendArray(cmd, 13); Delay_ms(5);
 
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
@@ -118,9 +125,9 @@ void you_(uint32_t mm)
     Serial_SendArray(cmd, 13); Delay_ms(5);
     cmd[0] = 0x02; cmd[2] = 0x00;   /* FR */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL */
+    cmd[0] = 0x03; cmd[2] = 0x01;   /* RL */
     Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR */
+    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR */
     Serial_SendArray(cmd, 13); Delay_ms(5);
 
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);

@@ -215,7 +215,13 @@ void USART1_IRQHandler(void)
         else if (RxState == 1)
         {
             Serial_RxPacket[pRxPacket++] = RxData;
-            if (pRxPacket >= 4)                     /* 收够 4 字节 */
+            if (Serial_RxPacket[1] == 0x36 && pRxPacket >= 8) { /* 专门为读电机实时位置设计的，手册p72页 */
+                RxState = 0;
+                if (Serial_RxPacket[7] == 0x6B) {
+                    Serial_RxFlag = 1;
+                }   
+            }
+            else if (pRxPacket >= 4)                     /* 收够 4 字节 */
             {
                 RxState = 0;
                 if (Serial_RxPacket[3] == 0x6B)     /* 尾校验 */
@@ -223,7 +229,21 @@ void USART1_IRQHandler(void)
                     Serial_RxFlag = 1;
                 }
             }
+            
         }
+
+        // else if (RxState == 1)
+        // {
+        //     Serial_RxPacket[pRxPacket++] = RxData;
+        //     if (pRxPacket >= 4)                     /* 收够 4 字节 */
+        //     {
+        //         RxState = 0;
+        //         if (Serial_RxPacket[3] == 0x6B)     /* 尾校验 */
+        //         {
+        //             Serial_RxFlag = 1;
+        //         }
+        //     }
+        // }
 
         USART_ClearITPendingBit(USART1, USART_IT_RXNE);
     }
