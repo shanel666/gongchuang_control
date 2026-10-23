@@ -337,7 +337,7 @@
             <v6Rtti>0</v6Rtti>
             <VariousControls>
               <MiscControls>--no-multibyte-chars</MiscControls>
-              <Define>USE_STDPERIPH_DRIVER</Define>
+              <Define>USE_STDPERIPH_DRIVER,__CORTEX_M3</Define>
               <Undefine></Undefine>
               <IncludePath>.\Start;.\Library;.\User;.\System;.\Hardware;.\mingling;.\app</IncludePath>
             </VariousControls>
@@ -722,6 +722,16 @@
               <FileName>Gyro.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\Gyro.h</FilePath>
+            </File>
+            <File>
+              <FileName>Servo.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\Servo.c</FilePath>
+            </File>
+            <File>
+              <FileName>Servo.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\Servo.h</FilePath>
             </File>
           </Files>
         </Group>
@@ -1513,6 +1523,16 @@
               <FileName>Gyro.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Hardware\Gyro.h</FilePath>
+            </File>
+            <File>
+              <FileName>Servo.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Hardware\Servo.c</FilePath>
+            </File>
+            <File>
+              <FileName>Servo.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Hardware\Servo.h</FilePath>
             </File>
           </Files>
         </Group>

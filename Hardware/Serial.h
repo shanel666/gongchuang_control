@@ -43,5 +43,13 @@ void USART3_SendAngleCentiDegrees(int32_t centi_degrees);
 /* 自检：按顺序发送字符串/字符/整数/小数/角度，串口终端可核对输出。 */
 void USART3_SelfTest(void);
 
+/* ---------------- K230 圆心数据（USART2，ASCII "x,y\r\n"） ----------------
+ * 中断里按行解析；只有格式和范围都正确的行才更新下面两个值和帧计数，
+ * 所以 K230 断线时这里不会留下"过期但看着还有值"的假数据。
+ * K230_GetCenter() 返回 1 表示至少收到过一帧有效数据。 */
+extern volatile uint16_t K230_CircleX;
+extern volatile uint16_t K230_CircleY;
+extern volatile uint32_t K230_FrameCount;
+uint8_t K230_GetCenter(uint16_t *x, uint16_t *y);
 
 #endif

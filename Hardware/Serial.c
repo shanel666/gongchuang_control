@@ -280,6 +280,89 @@ void USART2_SendByte(uint8_t byte)
     USART_SendData(USART2, byte);
     while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);
 }
+/* ---------------- K230 圆心数据：ASCII "320,240\r\n" ----------------
+ * 和陀螺仪二进制帧共用 USART2 接收中断：这里只接受数字、逗号和空格，
+ * 其它字节（陀螺仪帧头 0x55 等）直接丢弃当前行，避免把二进制当文本解析。
+ * 一行收完后统一校验：必须是 "数字,数字"，最多 4 位，范围 0~999，
+ * 校验不过整行丢弃，不覆盖上一帧有效数据。 */
+#define K230_LINE_MAX   16u
+
+volatile uint16_t K230_CircleX = 0;
+volatile uint16_t K230_CircleY = 0;
+volatile uint32_t K230_FrameCount = 0;
+
+static char    k230_line[K230_LINE_MAX];
+static uint8_t k230_len = 0;
+
+/* 解析一行 "x,y"；格式/范围不对就返回，不更新数据。 */
+static void K230_LineCommit(void)
+{
+    uint8_t  i = 0;
+    uint8_t  nd = 0;
+    uint16_t x = 0, y = 0;
+
+    while (i < k230_len && k230_line[i] == ' ') i++;
+
+    while (i < k230_len && k230_line[i] >= '0' && k230_line[i] <= '9')
+    {
+        x = (uint16_t)(x * 10u + (uint16_t)(k230_line[i] - '0'));
+        if (++nd > 4u) return;                          /* 数字位过多 */
+        i++;
+    }
+    if (nd == 0u) return;                               /* 没有 x 数值 */
+
+    while (i < k230_len && k230_line[i] == ' ') i++;
+    if (i >= k230_len || k230_line[i] != ',') return;   /* 缺逗号 */
+    i++;
+
+    while (i < k230_len && k230_line[i] == ' ') i++;
+    nd = 0u;
+    while (i < k230_len && k230_line[i] >= '0' && k230_line[i] <= '9')
+    {
+        y = (uint16_t)(y * 10u + (uint16_t)(k230_line[i] - '0'));
+        if (++nd > 4u) return;
+        i++;
+    }
+    if (nd == 0u) return;                               /* 没有 y 数值 */
+
+    while (i < k230_len && k230_line[i] == ' ') i++;
+    if (i != k230_len) return;                          /* 行尾还有多余字符 */
+
+    if (x > 999u || y > 999u) return;                   /* 超出图像范围，按噪声丢弃 */
+
+    K230_CircleX = x;
+    K230_CircleY = y;
+    K230_FrameCount++;                                  /* 每帧有效数据自增，供主循环判"新帧" */
+}
+
+/* 逐字节喂给行缓冲；只收合法文本字符，遇 \r/\n 结束一行。 */
+static void K230_FeedByte(uint8_t ch)
+{
+    if (ch == '\r' || ch == '\n')
+    {
+        if (k230_len != 0u) K230_LineCommit();
+        k230_len = 0u;
+    }
+    else if ((ch >= '0' && ch <= '9') || ch == ',' || ch == ' ')
+    {
+        if (k230_len < (K230_LINE_MAX - 1u)) k230_line[k230_len++] = (char)ch;
+        else k230_len = 0u;                             /* 超长，丢弃整行重新同步 */
+    }
+    else
+    {
+        k230_len = 0u;                                  /* 非文本字节，丢弃当前行 */
+    }
+}
+
+uint8_t K230_GetCenter(uint16_t *x, uint16_t *y)
+{
+    if (K230_FrameCount == 0u) return 0u;
+
+    if (x != 0) *x = K230_CircleX;
+    if (y != 0) *y = K230_CircleY;
+    return 1u;
+}
+
 /* USART2 模拟按键：收到 k:1 / k:2 / k:3 时置位 */
 #include "motor.h"
 void USART2_IRQHandler(void)
@@ -294,6 +377,7 @@ void USART2_IRQHandler(void)
         /* USART2 同时接收电脑调试文本和 JY901 二进制帧；二进制数据交给
          * 陀螺仪解析器，不能像普通串口回显那样原样发回。 */
         Gyro_ProcessByte(ch);
+        K230_FeedByte(ch);          /* K230 的 "x,y" 文本行，和上面的 k:数字 互不影响 */
         switch (state)
         {
             case 0:

@@ -9,14 +9,18 @@
 void Key_Init(void)
 {
 	/*开启时钟*/
-	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);		//开启GPIOB的时钟
-	
+	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);	//开启GPIOA、GPIOB的时钟
+
 	/*GPIO初始化*/
 	GPIO_InitTypeDef GPIO_InitStructure;
 	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
 	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1 | GPIO_Pin_11|GPIO_Pin_10;
 	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
 	GPIO_Init(GPIOB, &GPIO_InitStructure);						//将PB1和PB11引脚初始化为上拉输入
+
+	/*PA11(舵机角度-)、PA12(舵机角度+)上拉输入*/
+	GPIO_InitStructure.GPIO_Pin = GPIO_Pin_11 | GPIO_Pin_12;
+	GPIO_Init(GPIOA, &GPIO_InitStructure);
 }
 
 /**
@@ -52,6 +56,22 @@ uint8_t Key_GetNum(void)
 		Delay_ms(20);											//延时消抖
 		KeyNum = 3;												//置键码为2
 	}
-	
+
+	if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_12) == 0)			//PA12：舵机角度 +1
+	{
+		Delay_ms(20);											//延时消抖
+		while (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_12) == 0);	//等待按键松手
+		Delay_ms(20);											//延时消抖
+		KeyNum = 4;
+	}
+
+	if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) == 0)			//PA11：舵机角度 -1
+	{
+		Delay_ms(20);											//延时消抖
+		while (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) == 0);	//等待按键松手
+		Delay_ms(20);											//延时消抖
+		KeyNum = 5;
+	}
+
 	return KeyNum;			//返回键码值，如果没有按键按下，所有if都不成立，则键码为默认值0
 }

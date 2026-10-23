@@ -30,10 +30,54 @@
  *   校验固定 0x6B。
  */
 
+/* 方向位按地址取反：换电机/拆装轮子后某只轮子转向相反时，靠 motor.h 里的
+ * MOTOR_DIR_INV_x 翻回来，不用去改每个动作里那张方向表。 */
+static uint8_t motor_dir_bit(uint8_t addr, uint8_t dir)
+{
+    uint8_t inv = 0u;
+
+    if      (addr == 0x01u) inv = MOTOR_DIR_INV_1;
+    else if (addr == 0x02u) inv = MOTOR_DIR_INV_2;
+    else if (addr == 0x03u) inv = MOTOR_DIR_INV_3;
+    else if (addr == 0x04u) inv = MOTOR_DIR_INV_4;
+
+    return (uint8_t)(dir ^ (inv ? 0x01u : 0x00u));
+}
+
+/* 给一个地址发一帧：地址 + 逻辑方向 → 实际方向位 → 发送。
+ * 把"地址"和"方向"写在一起，改 MOTOR_ADDR_* 时不会漏改另一处。 */
+#define SEND_WHEEL(a, d)                                    \
+    do {                                                    \
+        cmd[0] = (uint8_t)(a);                              \
+        cmd[2] = motor_dir_bit((uint8_t)(a), (uint8_t)(d)); \
+        Serial_SendArray(cmd, 13);                          \
+        Delay_ms(5);                                        \
+    } while(0)
+
+/* ============================================================================
+ * 方向表（2026-10-23 换电机后实测标定）
+ * ----------------------------------------------------------------------------
+ * 这套轮子的滚子朝向是"同手"的（不是常规左右镜像），所以运动学映射和教科书
+ * 不一样，实测结果是：
+ *
+ *   前进  FL 1  FR 0  RL 0  RR 1     ← 对角轮一组（FL/RR vs FR/RL）
+ *   后退  全部取反
+ *   右平移 FL 0  FR 0  RL 1  RR 1    ← 前后一组
+ *   左平移 全部取反
+ *   旋转  四个轮子同向（全 0 或全 1）
+ *   注意：  FL 1 FR 0 RL 1 RR 0 这种"左右一组"会让四个轮子互相抵消，车不动。
+ *
+ * 对应关系是现场按 P1/P2/P3 逐项试出来的，别再照教科书改回去。
+ * 2026-10-23 二次修正：P1 前进/后退实测相反，两张表已对调（即前进改成原来的后退表）。
+ * 若以后换电机后某个轮子个别反了，用单电机点动对比，再把 motor.h 里的
+ * MOTOR_DIR_INV_x 置 1，不用改下面这几张表。
+ * ========================================================================== */
+
 /* 前进：mm 毫米 */
 void qianjin_(uint32_t mm)
 {
     uint32_t p = mm * PULSE_PER_100CM / 1000u;   /* 脉冲数 */
+    uint8_t  f = (uint8_t)(MOTOR_FLIP_FWD ? 0x01u : 0x00u);   /* 整轴取反开关 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
@@ -41,14 +85,10 @@ void qianjin_(uint32_t mm)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-    cmd[0] = 0x01; cmd[2] = 0x01;   /* FL 正转 */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x02; cmd[2] = 0x00;   /* FR 反转（镜像） */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x01;   /* RL 正转 */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR 反转（镜像） */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
+    SEND_WHEEL(MOTOR_ADDR_FL, 0x01 ^ f);   /* 实测前进表：FL 1 FR 0 RL 0 RR 1 */
+    SEND_WHEEL(MOTOR_ADDR_FR, 0x00 ^ f);
+    SEND_WHEEL(MOTOR_ADDR_RL, 0x00 ^ f);
+    SEND_WHEEL(MOTOR_ADDR_RR, 0x01 ^ f);
 
     /* 同步释放：直行 sync=0x01，此帧让 4 个电机同时起步 */
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
@@ -59,6 +99,7 @@ void qianjin_(uint32_t mm)
 void houtui_(uint32_t mm)
 {
     uint32_t p = mm * PULSE_PER_100CM / 1000u;
+    uint8_t  f = (uint8_t)(MOTOR_FLIP_FWD ? 0x01u : 0x00u);   /* 与前进共用同一个整轴开关 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
@@ -66,23 +107,21 @@ void houtui_(uint32_t mm)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-    cmd[0] = 0x01; cmd[2] = 0x00;   /* FL 反转 */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x02; cmd[2] = 0x01;   /* FR 正转（镜像） */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL 反转 */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR 正转（镜像） */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
+    SEND_WHEEL(MOTOR_ADDR_FL, 0x00 ^ f);   /* 后退 = 前进表取反 */
+    SEND_WHEEL(MOTOR_ADDR_FR, 0x01 ^ f);
+    SEND_WHEEL(MOTOR_ADDR_RL, 0x01 ^ f);
+    SEND_WHEEL(MOTOR_ADDR_RR, 0x00 ^ f);
 
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
 	Delay_ms(5);
 }
 
-/* 左平移 */
+/* 左平移：实测是"前后一组"（FL/FR 一组、RL/RR 另一组反着转）。
+ * 注意旧的"四个轮子同向"其实是旋转，已按实测改掉。 */
 void zuo_(uint32_t mm)
 {
     uint32_t p = mm * PULSE_PER_100CM / 1000u;
+    uint8_t  f = (uint8_t)(MOTOR_FLIP_LAT ? 0x01u : 0x00u);   /* 左右轴整轴取反开关 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
@@ -90,14 +129,10 @@ void zuo_(uint32_t mm)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-    cmd[0] = 0x01; cmd[2] = 0x01;   /* FL */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x02; cmd[2] = 0x01;   /* FR */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x01;   /* RL */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
+    SEND_WHEEL(MOTOR_ADDR_FL, 0x01 ^ f);   /* 实测左平移表：FL 1 FR 1 RL 0 RR 0 */
+    SEND_WHEEL(MOTOR_ADDR_FR, 0x01 ^ f);
+    SEND_WHEEL(MOTOR_ADDR_RL, 0x00 ^ f);
+    SEND_WHEEL(MOTOR_ADDR_RR, 0x00 ^ f);
 
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
 	Delay_ms(5);
@@ -107,6 +142,7 @@ void zuo_(uint32_t mm)
 void you_(uint32_t mm)
 {
     uint32_t p = mm * PULSE_PER_100CM / 1000u;
+    uint8_t  f = (uint8_t)(MOTOR_FLIP_LAT ? 0x01u : 0x00u);   /* 与左平移共用同一个整轴开关 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
@@ -114,14 +150,10 @@ void you_(uint32_t mm)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-    cmd[0] = 0x01; cmd[2] = 0x00;   /* FL */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x02; cmd[2] = 0x00;   /* FR */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
+    SEND_WHEEL(MOTOR_ADDR_FL, 0x00 ^ f);   /* 实测右平移表：FL 0 FR 0 RL 1 RR 1 */
+    SEND_WHEEL(MOTOR_ADDR_FR, 0x00 ^ f);
+    SEND_WHEEL(MOTOR_ADDR_RL, 0x01 ^ f);
+    SEND_WHEEL(MOTOR_ADDR_RR, 0x01 ^ f);
 
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
 	Delay_ms(5);
@@ -130,7 +162,8 @@ void you_(uint32_t mm)
 /* 右旋转（同步触发）*/
 void shun_yaw_(uint32_t deg)
 {
-    uint32_t p = deg *PULSE_PER_360DEG/360u;
+    uint32_t p = deg * PULSE_PER_360DEG / 360u;
+    uint8_t  d = (uint8_t)(0x00u ^ MOTOR_YAW_SWAP);   /* 四个轮子同向：0 与 1 是相反的两个转向 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
@@ -138,14 +171,10 @@ void shun_yaw_(uint32_t deg)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-    cmd[0] = 0x01; cmd[2] = 0x00;   /* FL */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x02; cmd[2] = 0x00;   /* FR */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x00;   /* RL */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x00;   /* RR */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
+    SEND_WHEEL(MOTOR_ADDR_FL, d);
+    SEND_WHEEL(MOTOR_ADDR_FR, d);
+    SEND_WHEEL(MOTOR_ADDR_RL, d);
+    SEND_WHEEL(MOTOR_ADDR_RR, d);
 	
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
 	Delay_ms(5);
@@ -154,7 +183,8 @@ void shun_yaw_(uint32_t deg)
 /* 左旋转（同步触发）*/
 void ni_yaw_(uint32_t deg)
 {
-    uint32_t p = deg*PULSE_PER_360DEG/360u ;
+    uint32_t p = deg * PULSE_PER_360DEG / 360u;
+    uint8_t  d = (uint8_t)(0x01u ^ MOTOR_YAW_SWAP);   /* 四个轮子同向：0 与 1 是相反的两个转向 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
@@ -162,14 +192,10 @@ void ni_yaw_(uint32_t deg)
     cmd[8] = (uint8_t)(p >> 8);
     cmd[9] = (uint8_t)p;
 
-    cmd[0] = 0x01; cmd[2] = 0x01;   /* FL */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x02; cmd[2] = 0x01;   /* FR */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x03; cmd[2] = 0x01;   /* RL */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
-    cmd[0] = 0x04; cmd[2] = 0x01;   /* RR */
-    Serial_SendArray(cmd, 13); Delay_ms(5);
+    SEND_WHEEL(MOTOR_ADDR_FL, d);
+    SEND_WHEEL(MOTOR_ADDR_FR, d);
+    SEND_WHEEL(MOTOR_ADDR_RL, d);
+    SEND_WHEEL(MOTOR_ADDR_RR, d);
 	
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
 	Delay_ms(5);
@@ -198,8 +224,8 @@ static void motor_send_speed_command(uint8_t address, uint8_t direction, uint16_
 
 void motor_rotate_speed(uint8_t direction, uint16_t rpm)
 {
-    motor_send_speed_command(0x01, direction, rpm);
-    motor_send_speed_command(0x02, direction, rpm);
+    motor_send_speed_command(MOTOR_ADDR_FL, direction, rpm);
+    motor_send_speed_command(MOTOR_ADDR_FR, direction, rpm);
 }
 
 void motor_rotate_speed_stop(void)
@@ -267,6 +293,35 @@ uint8_t cmd[13] = {
     0x00,                       // [11] 保留
     0x6B                        // [12] 尾部
 };
+/* 单电机点动：只驱动一个地址，立即执行（同步位 = 0，不需要同步释放帧）。
+ * 转速和加速度取得比整车低，方便肉眼确认"这个地址是哪个轮子、往哪转"。
+ * 换电机/改地址后先用它把 4 个轮子对上号，再改 motor.h 里的 MOTOR_ADDR_*。 */
+#define JOG_SPEED   30u     /* 点动速度，比 MOTOR_SPEED 慢 */
+#define JOG_ACCEL   100u    /* 点动加速度 */
+
+void motor_jog_addr(uint8_t addr, uint8_t reverse, uint32_t pulses)
+{
+    uint8_t cmd[13] = {
+        addr, 0xFD, 0x00,
+        (uint8_t)(JOG_SPEED >> 8), (uint8_t)(JOG_SPEED & 0xFFu), (uint8_t)JOG_ACCEL,
+        0x00, 0x00, 0x00, 0x00,
+        0x00,   /* 相对位置模式 */
+        0x00,   /* 立即执行，不等同步帧 */
+        0x6B
+    };
+
+    /* 点动也走同一套极性修正；注意当前映射下"前进"是 FL0 FR1 RL1 RR0 的混合表，
+     * 所以 JOG+ 只代表该地址的一个固定方向，用来核对"地址 ↔ 轮子"就够了。 */
+    cmd[2] = motor_dir_bit(addr, reverse ? 0x01u : 0x00u);
+    cmd[6] = (uint8_t)(pulses >> 24);
+    cmd[7] = (uint8_t)(pulses >> 16);
+    cmd[8] = (uint8_t)(pulses >> 8);
+    cmd[9] = (uint8_t)pulses;
+
+    Serial_SendArray(cmd, 13);
+    Delay_ms(5);
+}
+
 void motor_set_pos(int32_t pos)
 {
     uint32_t absp;
@@ -283,7 +338,7 @@ void motor_set_pos(int32_t pos)
         absp = (uint32_t)pos;
     }
 
-    cmd[2] = dir;
+    cmd[2] = motor_dir_bit(cmd[0], dir);   /* 同样套用单轮极性修正 */
     cmd[6] = (uint8_t)(absp >> 24);
     cmd[7] = (uint8_t)(absp >> 16);
     cmd[8] = (uint8_t)(absp >> 8);
