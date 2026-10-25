@@ -789,6 +789,21 @@
               <FilePath>.\app\motor.h</FilePath>
             </File>
             <File>
+              <FileName>chassis.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\chassis.c</FilePath>
+            </File>
+            <File>
+              <FileName>chassis.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\chassis.h</FilePath>
+            </File>
+            <File>
+              <FileName>chassis_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\chassis_config.h</FilePath>
+            </File>
+            <File>
               <FileName>path_planner.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\app\path_planner.c</FilePath>
@@ -1588,6 +1603,21 @@
               <FileName>motor.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\app\motor.h</FilePath>
+            </File>
+            <File>
+              <FileName>chassis.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\chassis.c</FilePath>
+            </File>
+            <File>
+              <FileName>chassis.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\chassis.h</FilePath>
+            </File>
+            <File>
+              <FileName>chassis_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\chassis_config.h</FilePath>
             </File>
             <File>
               <FileName>path_planner.c</FileName>

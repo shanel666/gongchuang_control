@@ -461,11 +461,27 @@ void USART2_SendInt(int32_t v)
     USART2_SendDec((uint32_t)v);
 }
 
-/* USART3 输出：采用默认映射，TX 为 PB10，RX 为 PB11；当前只启用发送方向。 */
+/* ---------------- USART3：无线串口（上位机 115200） ----------------
+ * 默认映射 PB10(TX) / PB11(RX)。发送用于调试文本，接收按"一行一条命令"
+ * 处理：\r 或 \n 结尾。中断里用双缓冲，主循环拿走 ready 缓冲区时中断写
+ * 另一个缓冲区，避免边读边被覆盖。
+ * 注意：PB10/PB11 和按键复用，接无线模块后 PB10/PB11 两个按键不要再用。 */
+#define USART3_LINE_MAX   64u
+
+volatile uint32_t USART3_RxCount = 0;              /* 完整行计数（1 = 有新行） */
+
+static char             usart3_rx_buf[2][USART3_LINE_MAX];
+static volatile uint8_t usart3_rx_active = 0;      /* 中断正在写哪个缓冲区 */
+static volatile uint8_t usart3_rx_ready_idx = 0;   /* 已收完、等主循环取走的缓冲区 */
+static volatile uint8_t usart3_rx_ready = 0;
+static volatile uint8_t usart3_rx_len = 0;
+
+/* USART3：默认映射，TX=PB10，RX=PB11，全双工 */
 void USART3_Init(uint32_t bound)
 {
     GPIO_InitTypeDef GPIO_InitStructure;
     USART_InitTypeDef USART_InitStructure;
+    NVIC_InitTypeDef NVIC_InitStructure;
 
     /* 使能 GPIOB 和 USART3 时钟（不需要 AFIO 时钟） */
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
@@ -477,15 +493,93 @@ void USART3_Init(uint32_t bound)
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOB, &GPIO_InitStructure);
 
+    /* USART3 RX -> PB11（上拉输入，空闲为高；无线模块的 TX 接这里） */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_11;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOB, &GPIO_InitStructure);
+
     USART_InitStructure.USART_BaudRate = bound;
     USART_InitStructure.USART_WordLength = USART_WordLength_8b;
     USART_InitStructure.USART_StopBits = USART_StopBits_1;
     USART_InitStructure.USART_Parity = USART_Parity_No;
     USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
-    USART_InitStructure.USART_Mode = USART_Mode_Tx;
+    USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
     USART_Init(USART3, &USART_InitStructure);
 
+    /* 接收中断：一行一条命令（无线串口） */
+    USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);
+
+    NVIC_InitStructure.NVIC_IRQChannel = USART3_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2;
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
     USART_Cmd(USART3, ENABLE);
+}
+
+/* 取走一行命令（不含 \r\n），有整行返回 1；没有返回 0。
+ * 复制期间关 RXNE 中断，避免中断正好把同一缓冲区换回来写。 */
+uint8_t USART3_ReadLine(char *line, uint8_t size)
+{
+    uint8_t i = 0;
+    uint8_t idx;
+
+    if (size == 0u) return 0u;
+
+    USART_ITConfig(USART3, USART_IT_RXNE, DISABLE);
+
+    if (!usart3_rx_ready)
+    {
+        USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);
+        return 0u;
+    }
+
+    idx = usart3_rx_ready_idx;
+    while (usart3_rx_buf[idx][i] != '\0' && (uint8_t)(i + 1u) < size)
+    {
+        line[i] = usart3_rx_buf[idx][i];
+        i++;
+    }
+    line[i] = '\0';
+    usart3_rx_ready = 0u;
+
+    USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);
+
+    return 1u;
+}
+
+/* USART3 接收中断：按 \r 或 \n 分帧。缓冲区满了就丢整行重新同步。 */
+void USART3_IRQHandler(void)
+{
+    if (USART_GetITStatus(USART3, USART_IT_RXNE) == SET)
+    {
+        uint8_t ch = USART_ReceiveData(USART3);
+
+        if (ch == '\r' || ch == '\n')
+        {
+            if (usart3_rx_len != 0u)
+            {
+                usart3_rx_buf[usart3_rx_active][usart3_rx_len] = '\0';
+                usart3_rx_ready_idx = usart3_rx_active;
+                usart3_rx_ready = 1u;
+                usart3_rx_active ^= 1u;          /* 换另一个缓冲区继续收 */
+                usart3_rx_len = 0u;
+                USART3_RxCount++;
+            }
+        }
+        else if (usart3_rx_len < (USART3_LINE_MAX - 1u))
+        {
+            usart3_rx_buf[usart3_rx_active][usart3_rx_len++] = (char)ch;
+        }
+        else
+        {
+            usart3_rx_len = 0u;                  /* 超长，丢弃整行 */
+        }
+
+        USART_ClearITPendingBit(USART3, USART_IT_RXNE);
+    }
 }
 
 void USART3_SendByte(uint8_t byte)

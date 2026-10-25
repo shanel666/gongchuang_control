@@ -7,9 +7,7 @@
  *   Serial_SendArray(buf, len)   Serial_SendByte(byte)   Delay_ms(ms)
  */
 
-/* —— 标定 —— */
-#define PULSE_PER_100CM  13008u   /* 平移标定：12658 脉冲 = 100 cm（已标定） */
-#define PULSE_PER_360DEG    17208u     /* 旋转标定：每度脉冲数 —— TODO 待标定！当前为占位值 360度 15800*/
+/* —— 标定（数值定义在 motor.h，chassis.c 也复用同一份） —— */
 
 /* 速度 / 加速度（可调） */
 #define MOTOR_SPEED      70    /* 速度 0x07D0；上位机默认 200 已较快 */
@@ -76,7 +74,7 @@ static uint8_t motor_dir_bit(uint8_t addr, uint8_t dir)
 /* 前进：mm 毫米 */
 void qianjin_(uint32_t mm)
 {
-    uint32_t p = mm * PULSE_PER_100CM / 1000u;   /* 脉冲数 */
+    uint32_t p = mm * MOTOR_PULSE_PER_100CM / 1000u;   /* 脉冲数 */
     uint8_t  f = (uint8_t)(MOTOR_FLIP_FWD ? 0x01u : 0x00u);   /* 整轴取反开关 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
@@ -98,7 +96,7 @@ void qianjin_(uint32_t mm)
 /* 后退：mm 毫米 */
 void houtui_(uint32_t mm)
 {
-    uint32_t p = mm * PULSE_PER_100CM / 1000u;
+    uint32_t p = mm * MOTOR_PULSE_PER_100CM / 1000u;
     uint8_t  f = (uint8_t)(MOTOR_FLIP_FWD ? 0x01u : 0x00u);   /* 与前进共用同一个整轴开关 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
@@ -120,7 +118,7 @@ void houtui_(uint32_t mm)
  * 注意旧的"四个轮子同向"其实是旋转，已按实测改掉。 */
 void zuo_(uint32_t mm)
 {
-    uint32_t p = mm * PULSE_PER_100CM / 1000u;
+    uint32_t p = mm * MOTOR_PULSE_PER_100CM / 1000u;
     uint8_t  f = (uint8_t)(MOTOR_FLIP_LAT ? 0x01u : 0x00u);   /* 左右轴整轴取反开关 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
@@ -141,7 +139,7 @@ void zuo_(uint32_t mm)
 /* 右平移*/
 void you_(uint32_t mm)
 {
-    uint32_t p = mm * PULSE_PER_100CM / 1000u;
+    uint32_t p = mm * MOTOR_PULSE_PER_100CM / 1000u;
     uint8_t  f = (uint8_t)(MOTOR_FLIP_LAT ? 0x01u : 0x00u);   /* 与左平移共用同一个整轴开关 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
@@ -162,7 +160,7 @@ void you_(uint32_t mm)
 /* 右旋转（同步触发）*/
 void shun_yaw_(uint32_t deg)
 {
-    uint32_t p = deg * PULSE_PER_360DEG / 360u;
+    uint32_t p = deg * MOTOR_PULSE_PER_360DEG / 360u;
     uint8_t  d = (uint8_t)(0x00u ^ MOTOR_YAW_SWAP);   /* 四个轮子同向：0 与 1 是相反的两个转向 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
@@ -183,7 +181,7 @@ void shun_yaw_(uint32_t deg)
 /* 左旋转（同步触发）*/
 void ni_yaw_(uint32_t deg)
 {
-    uint32_t p = deg * PULSE_PER_360DEG / 360u;
+    uint32_t p = deg * MOTOR_PULSE_PER_360DEG / 360u;
     uint8_t  d = (uint8_t)(0x01u ^ MOTOR_YAW_SWAP);   /* 四个轮子同向：0 与 1 是相反的两个转向 */
     uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
@@ -200,6 +198,37 @@ void ni_yaw_(uint32_t deg)
     Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
 	Delay_ms(5);
 	
+}
+
+/* 按 0.01° 旋转（陀螺仪闭环补差用）：
+ *   pulses = |centi| * MOTOR_PULSE_PER_360DEG / 36000
+ * 例：误差 10.00° -> 17208/360*10 = 478 脉冲；误差 36.00° -> 1721 脉冲。
+ * dir = 0x01 逆时针(左)、0x00 顺时针(右)，四个轮子同向、末尾发同步释放帧，
+ * 和 shun_/ni_ 的时序完全一致，只是分辨率从"整度"细化到"0.01°"。
+ * 返回实际发出的脉冲数（0 = 角度太小，没发）。 */
+uint32_t motor_rotate_centideg(uint8_t dir, int32_t centi)
+{
+    uint32_t deg_abs, p;
+    uint8_t  cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+
+    deg_abs = (uint32_t)((centi > 0L) ? centi : -centi);
+    p = deg_abs * MOTOR_PULSE_PER_360DEG / 36000u;
+    if(p == 0u) return 0u;
+
+    cmd[6] = (uint8_t)(p >> 24);
+    cmd[7] = (uint8_t)(p >> 16);
+    cmd[8] = (uint8_t)(p >> 8);
+    cmd[9] = (uint8_t)p;
+
+    SEND_WHEEL(MOTOR_ADDR_FL, dir);
+    SEND_WHEEL(MOTOR_ADDR_FR, dir);
+    SEND_WHEEL(MOTOR_ADDR_RL, dir);
+    SEND_WHEEL(MOTOR_ADDR_RR, dir);
+
+    Serial_SendByte(0x00); Serial_SendByte(0xFF); Serial_SendByte(0x66); Serial_SendByte(0x6B);
+    Delay_ms(5);
+
+    return p;
 }
 
 /* 发送 F6 速度模式命令：[地址][F6][方向][速度H][速度L][加速度][同步][6B]。

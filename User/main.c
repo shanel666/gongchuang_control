@@ -9,6 +9,8 @@
 #include "LED.h"
 #include "Servo.h"
 #include "motor.h"
+#include "chassis.h"
+#include "chassis_config.h"
 #include "path_planner.h"
 #include "path_config.h"
 
@@ -146,22 +148,24 @@ static u8 gyro_wait_new_sample(uint32_t *last_frame_count, int32_t *yaw)
 }
 
 /* ============================================================================
- * 陀螺仪闭环转向（全图路线和"闭环旋转测试"共用同一份实现）
+ * 陀螺仪闭环转向（绝对角度；全图路线和"闭环旋转测试"共用同一份实现）
  * ----------------------------------------------------------------------------
- * target_delta 单位 0.01°，正 = 逆时针（左转）、负 = 顺时针（右转）。
- *   ① 先按标定值把整个角度走完（不拆成小步，速度不受影响）；
- *   ② 等车体停稳再测一次实际转角，估"指令角度 → 实际转角"的增益（限幅 0.5~2.0）；
- *   ③ 之后按「误差 / 增益」补差，且必须换算成【度】再发；估不出增益就退回 Kp=0.5；
- *   ④ 误差 ≤ 0.1° 且连续 3 帧稳定算到位；最多补 5 次，用尽后残留 ≤1° 也算到位。
+ * 角度一律用"绝对角度"：开机时记一次零点 yaw_zero，之后 北=0°、西=+90°、
+ * 南=180°、东=-90°（逆时针为正，和陀螺仪一致）。每次转向都是"转到某个绝对角度"，
+ * 所以多段路线之间不会累积偏差。
  *
- * 已经踩过的两个坑：
- *   - 补差量必须把 0.01° 换算成"度"再交给 ni_yaw_/shun_yaw_；
- *     直接发会被限幅成 30°，表现就是每次都转过头（超调）。
- *   - 电机刚停时车体还在晃，必须等角度稳定再测，否则会反复过冲、来回振荡。
+ * 修正方式：按当前误差直接算脉冲，一步到位，不再按比例一点点逼近：
+ *     脉冲 = |误差| / 36000 * PULSE_PER_360DEG
+ *   例：误差 10.00° → 17208/360×10 = 478 脉冲；误差 36.00° → 1721 脉冲。
+ *   每次发完都等电机到位、等车体停稳，再读一次全局角度重算误差，
+ *   最多补 TURN_MAX_CORR 次（误差按 1-标定误差 的比例衰减，标定差一半也能收敛）。
+ *
+ * 已经踩过的坑：
+ *   - 补差必须换算成"度/脉冲"再发；把 0.01° 的数当度发，会每次被限幅成 30°（超调）。
+ *   - 电机刚停时车体还在晃，必须等角度稳定再测，否则会反复过冲。
  * ========================================================================== */
 #define TURN_TOL_CENTI       10L    /* 到位容差 0.1°（单位 0.01°） */
-#define TURN_MAX_CORR         5u    /* 补差次数上限 */
-#define TURN_MAX_STEP_DEG    30L    /* 单次补差最大角度 */
+#define TURN_MAX_CORR        15u    /* 补差次数上限（误差按 1-k 衰减，多给几次能兜住标定差） */
 #define TURN_SETTLE_MS      100u    /* 等停稳的采样间隔 */
 #define TURN_SETTLE_TOL      50L    /* 相邻两次采样差 < 0.5° 认为停稳 */
 #define TURN_SETTLE_TRIES     5u    /* 最多等 5 轮（0.5 s） */
@@ -169,11 +173,14 @@ static u8 gyro_wait_new_sample(uint32_t *last_frame_count, int32_t *yaw)
 
 static u8 gyro_ok;                  /* 收到过有效角度帧 */
 
-/* 最近一次闭环转向的过程量（测试模式直接显示，路线模式也用来看） */
-static volatile int32_t turn_dbg_target;     /* 目标，0.01° */
-static volatile int32_t turn_dbg_meas;       /* 实测相对转角，0.01° */
+/* 开机零点：所有绝对角度都相对它 */
+static int32_t yaw_zero;
+static u8      yaw_zero_ok;
+
+/* 最近一次闭环转向的过程量（测试模式直接显示，路线模式用来复盘） */
+static volatile int32_t turn_dbg_target;     /* 目标绝对角度，0.01° */
+static volatile int32_t turn_dbg_meas;       /* 当前绝对角度，0.01° */
 static volatile int32_t turn_dbg_err;        /* 最后误差，0.01° */
-static volatile int32_t turn_dbg_gain;       /* 估计增益 ×100，0 = 没估出来 */
 static volatile u8      turn_dbg_corr;       /* 补差次数 */
 static volatile u8      turn_dbg_result;     /* 1 到位 0 失败 */
 
@@ -215,94 +222,83 @@ static u8 gyro_turn_settle(int32_t *yaw)
     return 1u;
 }
 
-/* 闭环转 target_delta（0.01°），返回 1 到位 / 0 失败。
- * 过程量写进 turn_dbg_*，测试模式会把它显示出来。 */
-static u8 gyro_turn_by(int32_t target_delta)
-{
-    int32_t  start_yaw, yaw, rel, err, step, gain = 0L;
-    uint32_t deg_whole;
-    u8       corr = 0u, stable = 0u, first_measure = 1u;
 
-    turn_dbg_target = target_delta;
+/* 记开机零点：之后所有朝向都用相对它的绝对角度。最多等 1 s 等陀螺仪出数。 */
+static u8 yaw_zero_capture(void)
+{
+    int32_t z;
+    u16     i;
+
+    for(i = 0u; i < 100u; i++){
+        if(Gyro_GetYawCentiDegrees(&z)){
+            yaw_zero    = z;
+            yaw_zero_ok = 1u;
+            gyro_ok     = 1u;
+            return 1u;
+        }
+        Delay_ms(10);
+    }
+    yaw_zero    = 0L;
+    yaw_zero_ok = 0u;
+    return 0u;
+}
+
+/* 把 0.01° 显示成 ±ddd.cc（占 7 列），两个模式共用 */
+static void turn_show_2dp(uint8_t line, uint8_t col, int32_t centi)
+{
+    int32_t v = (centi < 0L) ? -centi : centi;
+
+    OLED_ShowChar(line, col, (centi < 0L) ? '-' : '+');
+    OLED_ShowNum(line, (uint8_t)(col + 1u), (uint32_t)(v / 100L), 3);
+    OLED_ShowChar(line, (uint8_t)(col + 4u), '.');
+    OLED_ShowNum(line, (uint8_t)(col + 5u), (uint32_t)(v % 100L), 2);
+}
+
+/* 转到绝对角度 target_abs（0.01°，相对开机零点），返回 1 到位 / 0 失败。
+ * 每次补差都按"当前误差 → 脉冲"一次到位，过程量写进 turn_dbg_*。 */
+static u8 gyro_turn_to_abs(int32_t target_abs)
+{
+    int32_t yaw = 0L, err;
+    u8      corr = 0u;
+
+    turn_dbg_target = target_abs;
     turn_dbg_meas   = 0L;
-    turn_dbg_err    = target_delta;
-    turn_dbg_gain   = 0L;
+    turn_dbg_err    = 0L;
     turn_dbg_corr   = 0u;
     turn_dbg_result = 0u;
 
-    /* 没有陀螺仪数据：退化成开环，保证还能动（测试模式会显示 NO GYRO） */
-    if(!Gyro_GetYawCentiDegrees(&start_yaw)){
-        if(target_delta > 0L) ni_yaw_(90u);
-        else                  shun_yaw_(90u);
-        Delay_ms(1000);
-        return wait_motors();
-    }
-    gyro_ok = 1u;
+    if(!Gyro_GetYawCentiDegrees(&yaw)) return 0u;   /* 没有陀螺仪没法闭环 */
 
-    /* ① 先走完整个角度 */
-    deg_whole = (uint32_t)(((target_delta > 0L) ? target_delta : -target_delta) + 50L) / 100u;
-    if(deg_whole < 1u) deg_whole = 1u;
-    if(target_delta > 0L) ni_yaw_(deg_whole);       /* 逆时针 */
-    else                  shun_yaw_(deg_whole);     /* 顺时针 */
-    Delay_ms(50);
-    if(!wait_motors()) return 0u;
-
-    while(1){
-        /* ② 停稳再测 */
-        if(!gyro_turn_settle(&yaw)) return 0u;
-
-        rel = gyro_wrap_180(yaw - start_yaw);
-        err = gyro_wrap_180(target_delta - rel);
-
-        turn_dbg_meas = rel;
+    while(corr < TURN_MAX_CORR){
+        turn_dbg_meas = gyro_wrap_180(yaw - yaw_zero);   /* 当前绝对角 */
+        err           = gyro_wrap_180(target_abs - yaw); /* 还差多少 */
         turn_dbg_err  = err;
 
-        /* 第一次量完估一次增益（0.01 倍，限幅 0.5~2.0） */
-        if(first_measure){
-            int32_t rel_abs;
-
-            first_measure = 0u;
-            rel_abs = (rel > 0L) ? rel : -rel;
-            if(rel_abs > 0L && deg_whole > 0u){
-                gain = rel_abs * 100L / (int32_t)deg_whole;
-                if(gain < 50L)  gain = 50L;
-                if(gain > 200L) gain = 200L;
-            }
-            turn_dbg_gain = gain;
-        }
-
-        /* 第 2 行右侧显示实时角度（judge 只用 1~5 列） */
+        /* 第 2 行右侧显示当前绝对角（judge 只用 1~5 列） */
         OLED_ShowString(2, 7, "Y");
-        OLED_ShowSignedNum(2, 8, yaw / 100L, 3);
+        OLED_ShowSignedNum(2, 8, turn_dbg_meas / 100L, 3);
 
         if(err <= TURN_TOL_CENTI && err >= -TURN_TOL_CENTI){
-            if(++stable >= 3u){ turn_dbg_result = 1u; return 1u; }
-            continue;
-        }
-        stable = 0u;
-
-        if(corr >= TURN_MAX_CORR){
-            turn_dbg_result = (err <= 100L && err >= -100L) ? 1u : 0u;
-            return turn_dbg_result;
+            turn_dbg_result = 1u;
+            return 1u;
         }
 
-        /* ③ 补差量：约定 step(度) = 误差(0.01°) / 增益(0.01 倍)，
-         *    两者单位都是 0.01，直接相除就是"度"。没增益退回 Kp=0.5。 */
-        if(gain > 0L) step = err / gain;
-        else          step = (err + 100L) / 200L;
-        if(step < 0L) step = -step;
-        if(step < 1L) step = 1L;
-        if(step > TURN_MAX_STEP_DEG) step = TURN_MAX_STEP_DEG;
+        /* ★ 按当前误差直接换脉冲：误差多少度就转多少度，不再一点点逼近。
+         *   err > 0 需要逆时针(0x01)，否则顺时针(0x00)。 */
+        (void)motor_rotate_centideg((err > 0L) ? 0x01u : 0x00u, err);
 
-        if(err > 0L) ni_yaw_((uint32_t)step);       /* 还差逆时针 */
-        else         shun_yaw_((uint32_t)step);     /* 转过头了，顺时针补回 */
-
-        Delay_ms(50);
         if(!wait_motors()) return 0u;
+        if(!gyro_turn_settle(&yaw)) return 0u;           /* 等停稳再测下一轮 */
 
         corr++;
         turn_dbg_corr = corr;
     }
+
+    /* 次数用尽：残留 ≤1° 也算到位，免得为一两度打断整条路线 */
+    turn_dbg_meas   = gyro_wrap_180(yaw - yaw_zero);
+    turn_dbg_err    = gyro_wrap_180(target_abs - yaw);
+    turn_dbg_result = (turn_dbg_err <= 100L && turn_dbg_err >= -100L) ? 1u : 0u;
+    return turn_dbg_result;
 }
 
 /* ===== 下面是旧版实现，保留作对照；实际使用的是上面的 gyro_turn_by ===== */
@@ -405,14 +401,18 @@ static u8 go_to(u16 *cx, u16 *cy, u16 tx, u16 ty)
  *   DEBUG_MODE_MOTOR   2 = 电机方向 / 地址自检（换电机后先用它）
  *   DEBUG_MODE_CIRCLE  1 = K230 圆心跟踪
  *   DEBUG_MODE_SERVO   0 = 舵机角度按键标定
+ *   DEBUG_MODE_CHASSIS 5 = 速度模式底盘自检（chassis.c，F6 + 定时停车）
+ *   DEBUG_MODE_WIRELESS 6 = 无线串口底盘测试（USART3 + 上位机 tools/chassis_host.py）
  * ========================================================================== */
 #define DEBUG_MODE_SERVO    0
 #define DEBUG_MODE_CIRCLE   1
 #define DEBUG_MODE_MOTOR    2
 #define DEBUG_MODE_ROUTE    3
 #define DEBUG_MODE_TURN     4
+#define DEBUG_MODE_CHASSIS  5
+#define DEBUG_MODE_WIRELESS 6
 
-#define DEBUG_MODE          DEBUG_MODE_ROUTE
+#define DEBUG_MODE          DEBUG_MODE_WIRELESS
 
 #if DEBUG_MODE == DEBUG_MODE_ROUTE
 
@@ -477,7 +477,18 @@ static u16 segment_len(u16 x0, u16 y0, u16 x1, u16 y1)
     return (u16)((x1 > x0) ? (x1 - x0) : (x0 - x1));
 }
 
+/* 朝向编号(1北 2西 3南 4东) → 相对开机零点的绝对角度（0.01°，逆时针为正） */
+static int32_t heading_abs(u8 d)
+{
+    switch(d){
+        case 2u:  return  9000L;    /* 西 = +90° */
+        case 3u:  return 18000L;    /* 南 = 180° */
+        case 4u:  return -9000L;    /* 东 = -90° */
+        default:  return     0L;    /* 北 = 0° */
+    }
+}
 /* 把车头对准 req 朝向：同向直行、相反倒车、±90° 走陀螺仪闭环转 */
+/* 把车头对准 req 朝向：同向直行、相反倒车、±90° 转到该朝向的绝对角度 */
 static u8 leg_face(u8 req)
 {
     u8 t = heading_turn(dir, req);
@@ -485,7 +496,19 @@ static u8 leg_face(u8 req)
     if(t == 0u){ seg_backward = 0u; return 1u; }
     if(t == 2u){ seg_backward = 1u; return 1u; }   /* 180°：不转，倒着走 */
 
-    if(!gyro_turn_by((t == 1u) ? 9000L : -9000L)) return 0u;
+    if(!yaw_zero_ok){
+        /* 没有陀螺仪：退化为开环 90°，保证路线还能跑完 */
+        if(t == 1u) ni_yaw_(90u);
+        else        shun_yaw_(90u);
+        Delay_ms(1000);
+        if(!wait_motors()) return 0u;
+        dir = req;
+        seg_backward = 0u;
+        return 1u;
+    }
+
+    /* ±90°：转到"该朝向对应的绝对角度"，闭环 */
+    if(!gyro_turn_to_abs(gyro_wrap_180(yaw_zero + heading_abs(req)))) return 0u;
 
     dir = req;
     seg_backward = 0u;
@@ -554,6 +577,12 @@ static void route_run(void)
         Delay_ms(1000);
     }
 
+    /* 记开机零点：把摆好的车头方向当成"北"，之后所有转向都用绝对角度 */
+    if(!yaw_zero_capture()){
+        OLED_ShowString(1, 1, "NO GYRO");
+        Delay_ms(800);
+    }
+
     while(1){
         /* ---- 顶栏：当前状态（case 号）；TO 由 leg_goto() 进来时自己画 ---- */
         if(step <= ROUTE_LEG_COUNT){
@@ -583,12 +612,12 @@ static void route_run(void)
         case 8: step = leg_goto(2250u, 2250u) ? 99u : (abort_flag ? 97u : 98u); break; /* → 回到起点 A */
 
         case 99:
-            /* 结束画面留最后一次转向的增益/补差次数，方便赛后复盘标定 */
+            /* 结束画面留最后一次转向的补差次数和残留误差，方便复盘 */
             OLED_ShowString(1, 1, "PATH DONE");
-            OLED_ShowString(3, 1, "G");
-            OLED_ShowNum(3, 2, (uint32_t)turn_dbg_gain, 3);
-            OLED_ShowString(3, 6, " C");
-            OLED_ShowNum(3, 8, turn_dbg_corr, 1);
+            OLED_ShowString(3, 1, "C");
+            OLED_ShowNum(3, 2, turn_dbg_corr, 1);
+            OLED_ShowString(3, 4, "E");
+            turn_show_2dp(3, 5, turn_dbg_err);
             Delay_ms(200);
             break;
 
@@ -608,47 +637,35 @@ static void route_run(void)
 #elif DEBUG_MODE == DEBUG_MODE_TURN
 
 /* ============================================================================
- * 闭环旋转单独测试（不跑路线）
+ * 闭环旋转单独测试（不跑路线，用绝对角度）
  * ----------------------------------------------------------------------------
- * 直接调用路线里同一个 gyro_turn_by()，只为把闭环转向单独验一遍。
+ * 直接调用路线里同一个 gyro_turn_to_abs()，把闭环转向单独验一遍。
  *
- *   PA12 = 逆时针（左转）转当前档位
- *   PA11 = 顺时针（右转）转当前档位
- *   PA8  = 切换档位 15° → 45° → 90° → 15° …
+ *   PA12 = 目标角度 +90°（逆时针一档）后转过去
+ *   PA11 = 目标角度 -90°（顺时针一档）后转过去
+ *   PA8  = 不改目标，原地重新对准当前目标（检验绝对闭环：用手扳歪再按一下就回正）
+ *
+ * 目标角度是"绝对角度"：开机时把当前车头方向记为 0°，之后 北=0 西=+90 南=180 东=-90。
  *
  * 每次转完把过程量留在屏幕上：
- *   1 行  TGT 目标角度   C 补差次数   G 增益×100（0 = 没估出来）
- *   2 行  左半是 judge 查询计数，右侧是陀螺仪实时角度 / NO GYRO
- *   3 行  MEA 实测相对转角
+ *   1 行  ABS 绝对目标角  C 补差次数
+ *   2 行  左半是 judge 查询计数，右侧是当前绝对角度 / NO GYRO
+ *   3 行  MEA 当前绝对角度
  *   4 行  ERR 最终误差 + OK / FAIL
  * ========================================================================== */
-static const u16 turn_test_deg[3] = {15u, 45u, 90u};
-
-/* 把 0.01° 显示成 ±ddd.cc（占 7 列） */
-static void turn_show_2dp(uint8_t line, uint8_t col, int32_t centi)
-{
-    int32_t v = (centi < 0L) ? -centi : centi;
-
-    OLED_ShowChar(line, col, (centi < 0L) ? '-' : '+');
-    OLED_ShowNum(line, (uint8_t)(col + 1u), (uint32_t)(v / 100L), 3);
-    OLED_ShowChar(line, (uint8_t)(col + 4u), '.');
-    OLED_ShowNum(line, (uint8_t)(col + 5u), (uint32_t)(v % 100L), 2);
-}
 
 /* 把最近一次转向的过程量画出来 */
-static void turn_test_show(void)
+static void turn_test_show(int32_t target)
 {
-    if(turn_dbg_target >= 0L){
-        OLED_ShowString(1, 1, "TGT+");
-        OLED_ShowNum(1, 5, (uint32_t)(turn_dbg_target / 100L), 3);
+    if(target >= 0L){
+        OLED_ShowString(1, 1, "ABS+");
+        OLED_ShowNum(1, 5, (uint32_t)(target / 100L), 3);
     }else{
-        OLED_ShowString(1, 1, "TGT-");
-        OLED_ShowNum(1, 5, (uint32_t)(-turn_dbg_target / 100L), 3);
+        OLED_ShowString(1, 1, "ABS-");
+        OLED_ShowNum(1, 5, (uint32_t)(-target / 100L), 3);
     }
-    OLED_ShowString(1, 9, "C");
-    OLED_ShowNum(1, 10, turn_dbg_corr, 1);
-    OLED_ShowString(1, 11, " G");
-    OLED_ShowNum(1, 13, (uint32_t)turn_dbg_gain, 3);
+    OLED_ShowString(1, 9, " C");
+    OLED_ShowNum(1, 11, turn_dbg_corr, 2);
 
     OLED_ShowString(3, 1, "MEA");
     turn_show_2dp(3, 5, turn_dbg_meas);
@@ -658,23 +675,14 @@ static void turn_test_show(void)
     OLED_ShowString(4, 12, turn_dbg_result ? " OK " : "FAIL");
 }
 
-static void turn_test_clear(void)
-{
-    turn_dbg_meas   = 0L;
-    turn_dbg_err    = 0L;
-    turn_dbg_gain   = 0L;
-    turn_dbg_corr   = 0u;
-    turn_dbg_result = 0u;
-}
-
 static void turn_test_run(void)
 {
-    u8 idx = 2u;                 /* 0=15° 1=45° 2=90°，默认 90° */
     u8 key;
-    int32_t target, yaw_now;
+    int32_t target = 0L;          /* 绝对目标角，0.01°；开机即为 0（对准零点） */
+    int32_t yaw_now;
     GPIO_InitTypeDef gpio;
 
-    /* PA8：换档位 */
+    /* PA8：重新对准 */
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
     gpio.GPIO_Pin   = GPIO_Pin_8;
     gpio.GPIO_Mode  = GPIO_Mode_IPU;
@@ -683,30 +691,33 @@ static void turn_test_run(void)
 
     OLED_Clear();
     OLED_ShowString(1, 1, "TURN TEST");
-    OLED_ShowString(3, 1, "A12=CCW A11=CW");
-    OLED_ShowString(4, 1, "PA8>NEXT ANGLE");
+    OLED_ShowString(3, 1, "A12=+90 A11=-90");
+    OLED_ShowString(4, 1, "PA8=REALIGN");
 
-    turn_dbg_target = (int32_t)turn_test_deg[idx] * 100L;
-    turn_test_clear();
+    /* 记开机零点：之后所有角度都是相对它的绝对角度 */
+    if(!yaw_zero_capture()){
+        OLED_ShowString(1, 1, "NO GYRO");
+    }
     Delay_ms(600);
-    turn_test_show();
+    turn_test_show(target);
 
     while(1){
-        /* 第 2 行右侧：陀螺仪状态（judge 只用 1~5 列） */
+        /* 第 2 行右侧：当前绝对角度（judge 只用 1~5 列） */
         if(Gyro_GetYawCentiDegrees(&yaw_now)){
             gyro_ok = 1u;
-            OLED_ShowString(2, 7, "Y");
-            OLED_ShowSignedNum(2, 8, yaw_now / 100L, 3);
+            if(yaw_zero_ok){
+                OLED_ShowString(2, 7, "Y");
+                OLED_ShowSignedNum(2, 8, gyro_wrap_180(yaw_now - yaw_zero) / 100L, 3);
+            }
         }else if(!gyro_ok){
             OLED_ShowString(2, 7, "NO GYRO");
         }
 
-        /* PA8：换档位 */
+        /* PA8：不改目标，重新对准当前目标（绝对闭环验证） */
         if(pa8_hit()){
-            idx = (u8)((idx + 1u) % 3u);
-            turn_dbg_target = (int32_t)turn_test_deg[idx] * 100L;
-            turn_test_clear();
-            turn_test_show();
+            OLED_ShowString(4, 1, "REALIGN...     ");
+            (void)gyro_turn_to_abs(target);
+            turn_test_show(target);
         }
 
         key = Key_GetNum();
@@ -715,12 +726,13 @@ static void turn_test_run(void)
             continue;
         }
 
-        target = (int32_t)turn_test_deg[idx] * 100L;   /* 0.01° */
-        if(key == 5) target = -target;                 /* PA11 = 顺时针 */
+        /* PA12 加一档 +90°，PA11 减一档 -90°，然后转到这个绝对角度 */
+        if(key == 4) target = gyro_wrap_180(target + 9000L);
+        else         target = gyro_wrap_180(target - 9000L);
 
         OLED_ShowString(4, 1, "TURNING...     ");
-        (void)gyro_turn_by(target);                    /* 过程量写进 turn_dbg_* */
-        turn_test_show();
+        (void)gyro_turn_to_abs(target);            /* 过程量写进 turn_dbg_* */
+        turn_test_show(target);
     }
 }
 #elif DEBUG_MODE == DEBUG_MODE_MOTOR
@@ -1001,6 +1013,385 @@ static void circle_track_test(void)
     }
 }
 
+#elif DEBUG_MODE == DEBUG_MODE_CHASSIS
+
+/* ============================================================================
+ * 速度模式底盘自检（F6 速度模式 + 定时停车）
+ * ----------------------------------------------------------------------------
+ * 这个模式只测 chassis.c 的新底盘逻辑，不碰 motor.c 的 FD 位置模式。
+ * 按键和电机自检页一致（这块板子只有 3 个键可用）：
+ *   PA12 = 本页第 1 个动作   PA11 = 本页第 2 个动作   PA8 = 翻页
+ * 运动中按 PA8 = 立即停车（走 chassis 的中止回调）。
+ *
+ *   第 1 页  前进 / 后退 100 mm
+ *   第 2 页  左平移 / 右平移 100 mm
+ *   第 3 页  逆时针 / 顺时针 90°
+ *   第 4 页  前进 / 后退 1000 mm（拿卷尺量：走多了调小
+ *            chassis_config.h 的 CHASSIS_TIME_GAIN_PCT，走少了调大）
+ *   第 5 页  前进 500 mm：慢速 / 快速（验证 Chassis_MoveAt 的速度覆盖）
+ * ========================================================================== */
+#define CHASSIS_TEST_PAGES   5u
+
+/* 运动中按下 PA8 就停车 */
+static u8 chassis_test_abort(void)
+{
+    return (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET) ? 1u : 0u;
+}
+
+/* 每页的静态提示（每行最多 16 列）；第 4 行固定显示 PA8 翻页 */
+static void chassis_check_draw(u8 page)
+{
+    OLED_Clear();
+
+    switch(page){
+        case 1:
+            OLED_ShowString(1, 1, "P1/5 FWD 100MM");
+            OLED_ShowString(2, 1, "A12 = FORWARD");
+            OLED_ShowString(3, 1, "A11 = BACK");
+            break;
+        case 2:
+            OLED_ShowString(1, 1, "P2/5 STRAFE");
+            OLED_ShowString(2, 1, "A12 = LEFT 100");
+            OLED_ShowString(3, 1, "A11 = RIGHT 100");
+            break;
+        case 3:
+            OLED_ShowString(1, 1, "P3/5 ROTATE 90");
+            OLED_ShowString(2, 1, "A12 = CCW 90");
+            OLED_ShowString(3, 1, "A11 = CW 90");
+            break;
+        case 4:
+            OLED_ShowString(1, 1, "P4/5 CAL 1000MM");
+            OLED_ShowString(2, 1, "A12 = FORWARD");
+            OLED_ShowString(3, 1, "A11 = BACK");
+            break;
+        default:
+            OLED_ShowString(1, 1, "P5/5 SPEED TEST");
+            OLED_ShowString(2, 1, "A12 = SLOW 500");
+            OLED_ShowString(3, 1, "A11 = FAST 500");
+            break;
+    }
+
+    OLED_ShowString(4, 1, "PA8>NEXT PAGE");
+}
+
+/* 按当前页 + 按键执行一个动作（A12=key4 走正向，A11=key5 走反向） */
+static void chassis_check_run(u8 page, u8 key)
+{
+    u8 ok = 0;
+
+    if(page == 1)       ok = (key == 4) ? Chassis_Move(100)   : Chassis_Move(-100);
+    else if(page == 2)  ok = (key == 4) ? Chassis_Strafe(100) : Chassis_Strafe(-100);
+    else if(page == 3)  ok = (key == 4) ? Chassis_Rotate(90)  : Chassis_Rotate(-90);
+    else if(page == 4)  ok = (key == 4) ? Chassis_Move(1000)  : Chassis_Move(-1000);
+    else                ok = (key == 4) ? Chassis_MoveAt(500, 150)
+                                        : Chassis_MoveAt(500, 700);
+
+    OLED_ShowString(4, 1, ok ? "OK            " : "ABORT         ");
+    Delay_ms(500);
+    chassis_check_draw(page);
+}
+
+/* 底盘自检主循环：不返回 */
+static void chassis_check_test(void)
+{
+    u8 page = 1u;
+    u8 key;
+    GPIO_InitTypeDef gpio;
+
+    /* PA8 当翻页键：上拉输入，按下接地 */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    gpio.GPIO_Pin   = GPIO_Pin_8;
+    gpio.GPIO_Mode  = GPIO_Mode_IPU;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &gpio);
+
+    Chassis_Init();                                   /* 使能 + 默认加速度 */
+    Chassis_SetAbortCheck(chassis_test_abort);
+
+    OLED_ShowString(1, 1, "CHASSIS TEST");
+    chassis_check_draw(page);
+
+    while(1){
+        /* PA8：翻页（带消抖和松手等待） */
+        if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET){
+            Delay_ms(20);
+            if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET){
+                page = (u8)((page % CHASSIS_TEST_PAGES) + 1u);
+                chassis_check_draw(page);
+                while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET) Delay_ms(10);
+                Delay_ms(20);
+            }
+        }
+
+        /* 只用 PA12(key 4) 和 PA11(key 5)，其余键码忽略 */
+        key = Key_GetNum();
+        if(key != 4 && key != 5){
+            Delay_ms(10);
+            continue;
+        }
+
+        OLED_ShowString(4, 1, "RUN...        ");
+        chassis_check_run(page, key);
+    }
+}
+
+#elif DEBUG_MODE == DEBUG_MODE_WIRELESS
+
+/* ============================================================================
+ * 无线串口底盘测试（USART3 / PB10=TX、PB11=RX，115200 8N1）
+ * ----------------------------------------------------------------------------
+ * 无线串口模块透传，电脑端用 tools/chassis_host.py 或任意串口助手发一行命令：
+ *
+ *   F 1000   前进 1000 ms          B 1000   后退 1000 ms
+ *   L 1000   左平移 1000 ms        R 1000   右平移 1000 ms
+ *   Q 1000   逆时针 1000 ms        E 1000   顺时针 1000 ms
+ *   S        立即停车              D        内置测试：
+ *                                           前进 1s → 逆时针 1s → 后退 1s → 顺时针 1s
+ *   ?        查状态（回 YAW）      P        ping
+ *   V 300    设默认速度（0.1RPM）  H        帮助
+ *
+ * 数字可以不写（默认 1000 ms），命令不区分大小写，F1000 / F 1000 都行。
+ * 回包都是 ASCII 一行：READY / ACK <命令> <ms> / DONE <命令> / ABORT <命令>
+ *                     / YAW <0.01 度> / PONG / SPEED <0.1RPM> / ERR ...
+ *
+ * 本地按键：PA8 = 空闲时跑内置测试，运动中 = 立即停车。
+ * 注意：USART3 的 PB11 和按键 2 复用，本模式不调用 Key_GetNum()。
+ * 上电默认不自动跑（安全），想上电就跑一次把 WIRELESS_AUTO_DEMO 改成 1。
+ * ========================================================================== */
+#define WIRELESS_DEFAULT_MS     1000u
+#define WIRELESS_MIN_MS          100u
+#define WIRELESS_MAX_MS        10000u
+#define WIRELESS_AUTO_DEMO         0
+
+static u16 g_wireless_speed_x10 = 0u;    /* 0 = 用 chassis_config.h 的默认速度 */
+static volatile u8 g_wireless_abort;     /* 运动中按 PA8 置 1 */
+
+/* 运动中按 PA8：置中止标志，Chassis_RunMs() 会提前停车 */
+static u8 wireless_abort(void)
+{
+    if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET){
+        g_wireless_abort = 1u;
+        return 1u;
+    }
+    return 0u;
+}
+
+/* 等 PA8 松开并清中止标志，避免松手后被当成"开始测试" */
+static void wireless_wait_pa8_release(void)
+{
+    while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET) Delay_ms(10);
+    Delay_ms(20);
+    g_wireless_abort = 0u;
+}
+
+/* 空闲时 PA8 短按：消抖 + 等松手，算一次 */
+static u8 wireless_pa8_hit(void)
+{
+    if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) != Bit_RESET) return 0u;
+    Delay_ms(20);
+    if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) != Bit_RESET) return 0u;
+    wireless_wait_pa8_release();
+    return 1u;
+}
+
+static void wireless_show_idle(void)
+{
+    OLED_ShowString(1, 1, "WIRELESS");
+    OLED_ShowString(2, 1, "WAIT CMD");
+    OLED_ShowString(3, 1, "USART3 115200");
+    OLED_ShowString(4, 1, "PA8=DEMO");
+}
+
+/* 回一行当前陀螺仪角度（0.01 度，没数据回 NA） */
+static void wireless_send_yaw(void)
+{
+    int32_t yaw;
+
+    if(Gyro_GetYawCentiDegrees(&yaw))
+        USART3_Printf("YAW %d\r\n", (int)yaw);
+    else
+        USART3_SendString("YAW NA\r\n");
+}
+
+/* 解析命令后面的数字：允许 "F1000" 或 "F 1000"，返回 1 表示有数字 */
+static u8 wireless_parse_num(const char *s, uint32_t *out)
+{
+    uint32_t v = 0u;
+    u8 digits = 0u;
+
+    while(*s == ' ' || *s == '\t') s++;
+    while(*s >= '0' && *s <= '9'){
+        if(v <= 100000u) v = v * 10u + (uint32_t)(*s - '0');
+        s++;
+        digits = 1u;
+    }
+
+    *out = v;
+    return digits;
+}
+
+/* 命令没带数字就用默认 1000 ms，并限幅到 100~10000 ms */
+static uint32_t wireless_ms(uint32_t arg, u8 has_arg)
+{
+    uint32_t ms = has_arg ? arg : WIRELESS_DEFAULT_MS;
+
+    if(ms < WIRELESS_MIN_MS) ms = WIRELESS_MIN_MS;
+    if(ms > WIRELESS_MAX_MS) ms = WIRELESS_MAX_MS;
+    return ms;
+}
+
+/* 执行一个定时动作并回 ACK/DONE/ABORT，最后回一次 YAW */
+static void wireless_do_action(ChassisAction action, char cmd, uint32_t ms)
+{
+    u8 ok;
+
+    USART3_Printf("ACK %c %u\r\n", cmd, (unsigned)ms);
+
+    OLED_ShowString(3, 1, "RUN ");
+    OLED_ShowChar(3, 5, cmd);
+    OLED_ShowNum(3, 7, ms, 5);
+
+    ok = Chassis_RunMs(action, ms, g_wireless_speed_x10);
+
+    if(!ok){
+        wireless_wait_pa8_release();
+        USART3_Printf("ABORT %c\r\n", cmd);
+        OLED_ShowString(2, 1, "ABORT   ");
+    }else{
+        USART3_Printf("DONE %c %u\r\n", cmd, (unsigned)ms);
+        OLED_ShowString(2, 1, "DONE    ");
+    }
+
+    wireless_send_yaw();
+}
+
+/* 内置测试：前进 1s → 逆时针 1s → 后退 1s → 顺时针 1s */
+static void wireless_demo(void)
+{
+    USART3_SendString("ACK D\r\n");
+    OLED_ShowString(2, 1, "DEMO...");
+
+    if(!Chassis_RunMs(CHASSIS_ACTION_FORWARD,  1000u, g_wireless_speed_x10)) goto aborted;
+    if(!Chassis_RunMs(CHASSIS_ACTION_CCW,      1000u, g_wireless_speed_x10)) goto aborted;
+    if(!Chassis_RunMs(CHASSIS_ACTION_BACKWARD, 1000u, g_wireless_speed_x10)) goto aborted;
+    if(!Chassis_RunMs(CHASSIS_ACTION_CW,       1000u, g_wireless_speed_x10)) goto aborted;
+
+    USART3_SendString("DONE D\r\n");
+    OLED_ShowString(2, 1, "DEMO DONE");
+    wireless_send_yaw();
+    return;
+
+aborted:
+    wireless_wait_pa8_release();
+    USART3_SendString("ABORT D\r\n");
+    OLED_ShowString(2, 1, "ABORT   ");
+}
+
+/* 处理一行命令（不区分大小写） */
+static void wireless_handle(char *line)
+{
+    char     cmd;
+    uint32_t arg = 0u;
+    u8       has_arg;
+    u8       i = 0u;
+
+    while(line[i] == ' ' || line[i] == '\t') i++;
+    if(line[i] == '\0') return;
+
+    cmd = line[i];
+    if(cmd >= 'a' && cmd <= 'z') cmd = (char)(cmd - 'a' + 'A');
+    has_arg = wireless_parse_num(&line[i + 1u], &arg);
+
+    switch(cmd){
+        case 'F': wireless_do_action(CHASSIS_ACTION_FORWARD,  cmd, wireless_ms(arg, has_arg)); break;
+        case 'B': wireless_do_action(CHASSIS_ACTION_BACKWARD, cmd, wireless_ms(arg, has_arg)); break;
+        case 'L': wireless_do_action(CHASSIS_ACTION_LEFT,     cmd, wireless_ms(arg, has_arg)); break;
+        case 'R': wireless_do_action(CHASSIS_ACTION_RIGHT,    cmd, wireless_ms(arg, has_arg)); break;
+        case 'Q': wireless_do_action(CHASSIS_ACTION_CCW,      cmd, wireless_ms(arg, has_arg)); break;
+        case 'E': wireless_do_action(CHASSIS_ACTION_CW,       cmd, wireless_ms(arg, has_arg)); break;
+
+        case 'S':
+            Chassis_Stop();
+            USART3_SendString("STOP\r\n");
+            OLED_ShowString(2, 1, "STOP    ");
+            break;
+
+        case 'D':
+            wireless_demo();
+            break;
+
+        case '?':
+            wireless_send_yaw();
+            break;
+
+        case 'P':
+            USART3_SendString("PONG\r\n");
+            break;
+
+        case 'V':
+            if(!has_arg){
+                USART3_SendString("ERR ARG\r\n");
+                break;
+            }
+            if(arg > CHASSIS_SPEED_MAX) arg = CHASSIS_SPEED_MAX;
+            g_wireless_speed_x10 = (u16)arg;
+            USART3_Printf("SPEED %u\r\n", (unsigned)arg);
+            break;
+
+        case 'H':
+            USART3_SendString("CMDS F B L R Q E <ms> | S | D | ? | P | V <0.1RPM>\r\n");
+            break;
+
+        default:
+            USART3_SendString("ERR CMD\r\n");
+            break;
+    }
+}
+
+/* 无线测试主循环：不返回 */
+static void wireless_test_run(void)
+{
+    char line[64];
+    GPIO_InitTypeDef gpio;
+
+    /* PA8：本地开始测试 / 运动中停车 */
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    gpio.GPIO_Pin   = GPIO_Pin_8;
+    gpio.GPIO_Mode  = GPIO_Mode_IPU;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &gpio);
+
+    Chassis_Init();                       /* 使能 4 个电机 */
+    Chassis_SetAbortCheck(wireless_abort);
+
+    OLED_Clear();
+    wireless_show_idle();
+
+    USART3_SendString("\r\nREADY CHASSIS WIRELESS 115200\r\n");
+    USART3_SendString("CMDS F B L R Q E <ms> | S | D | ? | P | V <0.1RPM>\r\n");
+
+#if WIRELESS_AUTO_DEMO
+    Delay_ms(2000);
+    wireless_demo();
+#endif
+
+    while(1){
+        if(USART3_ReadLine(line, (uint8_t)sizeof(line))){
+            wireless_handle(line);
+            wireless_show_idle();
+            continue;
+        }
+
+        if(!g_wireless_abort && wireless_pa8_hit()){
+            wireless_demo();
+            wireless_show_idle();
+            continue;
+        }
+
+        Delay_ms(5);
+    }
+}
+
 #else
 
 /* 舵机角度按键标定：PA12 每按一次 +1°，PA11 每按一次 -1°，限幅 0~100°。 */
@@ -1073,6 +1464,10 @@ int main(void)
 	motor_check_test();         /* 电机方向 / 地址自检（换电机后先用它） */
 #elif DEBUG_MODE == DEBUG_MODE_CIRCLE
 	circle_track_test();        /* K230 圆心跟踪：让圆心停在 (320,240) */
+#elif DEBUG_MODE == DEBUG_MODE_CHASSIS
+	chassis_check_test();       /* 速度模式底盘自检：前进/平移/旋转/标定 */
+#elif DEBUG_MODE == DEBUG_MODE_WIRELESS
+	wireless_test_run();        /* 无线串口底盘测试：USART3 + tools/chassis_host.py */
 #else
 	servo_angle_test();         /* 舵机角度按键标定 */
 #endif

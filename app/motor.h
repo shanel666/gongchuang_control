@@ -45,6 +45,14 @@
 #define MOTOR_FLIP_FWD    0u
 #define MOTOR_FLIP_LAT    0u
 
+/* ★ 标定值（motor.c 和 chassis.c 共用，改这里一处即可）：
+ *     MOTOR_PULSE_PER_100CM   平移：车走 1000 mm 需要多少脉冲
+ *     MOTOR_PULSE_PER_360DEG  旋转：车原地转 360° 需要多少脉冲
+ *   chassis.c 还会用它配合 CHASSIS_PULSES_PER_REV（驱动器细分）换算速度，
+ *   所以改了这里，位置模式和速度模式会一起变。 */
+#define MOTOR_PULSE_PER_100CM   13008u   /* 平移标定：13008 脉冲 = 1000 mm */
+#define MOTOR_PULSE_PER_360DEG  17208u   /* 旋转标定：17208 脉冲 = 360°（TODO 待标定） */
+
 /* 前进 / 后退：参数 = 距离 mm（头文件旧注释写 cm，以 motor.c 实现为准） */
 void qianjin_(uint32_t mm);
 void houtui_(uint32_t mm);
@@ -60,6 +68,11 @@ void ni_yaw_(uint32_t deg);
 /* 单电机点动：只给 addr 这一个地址发位置命令（立即执行，不等同步）。
  * reverse=1 反转。用于换电机后核对"地址 ↔ 轮子"和转向极性。 */
 void motor_jog_addr(uint8_t addr, uint8_t reverse, uint32_t pulses);
+
+/* 按 0.01° 旋转（陀螺仪闭环补差用）：pulses = |centi| * PULSE_PER_360DEG / 36000。
+ * dir = 0x01 逆时针(左)、0x00 顺时针(右)；四个轮子同向，末尾发同步释放帧。
+ * 返回实际发出的脉冲数（0 = 角度太小，没发）。 */
+uint32_t motor_rotate_centideg(uint8_t dir, int32_t centi);
 
 /* F6 速度模式：方向 0=CW，1=CCW；速度单位 RPM；当前用于陀螺仪转向测试。 */
 void motor_rotate_speed(uint8_t direction, uint16_t rpm);

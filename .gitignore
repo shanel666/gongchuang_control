@@ -31,3 +31,11 @@ JLinkLog.txt
 *.log
 *.zip
 *.rar
+
+# chassis.c 的 PC 端回归测试产物
+tmp_chassis_test/*.exe
+tmp_chassis_test/build_*
+
+# Python
+__pycache__/
+*.pyc

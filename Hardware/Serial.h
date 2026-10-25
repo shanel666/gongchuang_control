@@ -27,9 +27,15 @@ void USART2_SendHex32(uint32_t val);
 void USART2_SendDec(uint32_t val);
 void USART2_SendInt(int32_t v);
 
-/* USART3：陀螺仪角度文本输出，使用默认映射 PB10(TX)/PB11(RX)。 */
+/* USART3：陀螺仪角度文本输出 / 无线串口，使用默认映射 PB10(TX)/PB11(RX)。 */
 void USART3_Init(uint32_t bound);
 void USART3_SendByte(uint8_t byte);
+
+/* USART3 接收（无线串口）：中断里按 \r 或 \n 收一行，最多 63 字节。
+ * USART3_ReadLine() 取走一行（不含换行符），没有整行时返回 0。
+ * 注意 PB11 同时是按键 2，接无线模块后不要再调用 Key_GetNum()。 */
+extern volatile uint32_t USART3_RxCount;
+uint8_t USART3_ReadLine(char *line, uint8_t size);
 
 /* 通用发送：整数 / 小数 / 字符 / 字符串都能转换后经 USART3 发出。 */
 void USART3_SendString(const char *s);
