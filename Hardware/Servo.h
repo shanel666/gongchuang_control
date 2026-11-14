@@ -4,41 +4,49 @@
 #include <stdint.h>
 
 /*
- * 舵机 PWM 驱动
+ * 三路 270° 舵机 PWM（TIM3 完全重映射，20 ms 周期 / 50 Hz，500~2500 us = 0~270°）
  *
- * 引脚：PC8 = TIM3_CH3（TIM3 完全重映射）
- * 信号：20 ms 周期，高电平 500~2500 us
+ *   PC7 = TIM3_CH2 = 升降舵机   SERVO_LIFT
+ *   PC8 = TIM3_CH3 = 夹爪舵机   SERVO_GRIP
+ *   PC9 = TIM3_CH4 = 旋转舵机   SERVO_ROT
  *
- * 当前舵机实际可行角度为 0~100°。
- * 夹爪状态：38° = 张开，44° = 加紧；上电默认张开。
+ * 三路共用一个时基，三个 CCR 各自独立，改一路不影响另外两路。
+ * 脉宽映射：0° → 500 us，270° → 2500 us，中间线性；
+ * 超出 0~270° 自动限幅，避免舵机撞机械限位。
  */
 
-#define SERVO_MIN_PULSE_US  500u    /* 最小脉宽 */
-#define SERVO_MAX_PULSE_US  2500u   /* 最大脉宽 */
-#define SERVO_ANGLE_MAX     100u    /* 舵机可行角度上限，脉宽 500~2500 us 对应 0~100° */
+typedef enum {
+    SERVO_ROT = 0,      /* PC9 / CH4 旋转舵机 */
+    SERVO_LIFT,         /* PC7 / CH2 升降舵机 */
+    SERVO_GRIP,         /* PC8 / CH3 夹爪舵机 */
+    SERVO_COUNT
+} ServoId;
 
-#define SERVO_ANGLE_OPEN    38u     /* 夹爪张开角度 */
-#define SERVO_ANGLE_CLAMP   44u     /* 夹爪加紧角度 */
+/* 上电安全角度（机构定义的安全姿态）：旋转 240°、升降 90°、夹爪 65°。
+ * Servo_Init() 一上电就直接输出这三个角度，不会先甩到 0°。 */
+#define SERVO_ROT_INIT_DEG     240u
+#define SERVO_LIFT_INIT_DEG     90u
+#define SERVO_GRIP_INIT_DEG     65u
 
-/* 角度 -> 脉宽（编译期常量，四舍五入） */
-#define SERVO_ANGLE_TO_PULSE(angle) \
-	(SERVO_MIN_PULSE_US + ((SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) * (angle) \
-	 + SERVO_ANGLE_MAX / 2u) / SERVO_ANGLE_MAX)
+/* 现场角度微调（单位 度，可正可负）：某个舵机装偏了只改这里，
+ * 流程里写的目标角度不用动。实际输出角度 = 目标角度 + 微调。 */
+#define SERVO_TRIM_ROT      0
+#define SERVO_TRIM_LIFT     0
+#define SERVO_TRIM_GRIP     0
 
-/* 初始化 PC8 的 PWM，上电默认输出张开角度（38°，1260us） */
+#define SERVO_MIN_PULSE_US  500u    /* 0° 对应脉宽 */
+#define SERVO_MAX_PULSE_US  2500u   /* 270° 对应脉宽 */
+#define SERVO_ANGLE_MIN     0u
+#define SERVO_ANGLE_MAX     270u
+
+/* 初始化三路 PWM，并直接输出上面的安全角度 */
 void Servo_Init(void);
 
-/* 夹爪张开（38°）/ 加紧（44°） */
-void Servo_Open(void);
-void Servo_Clamp(void);
+/* 设置某一路角度（自动加微调、限幅到 0~270°） */
+void Servo_SetAngle(ServoId id, uint16_t deg);
 
-/* 直接设置脉宽，单位 us；超出 500~2500 会自动限幅 */
-void Servo_SetPulse(uint16_t pulse_us);
-
-/* 设置角度，范围 0~SERVO_ANGLE_MAX；超出会自动限幅 */
-void Servo_SetAngle(uint16_t angle_deg);
-
-/* 读取当前脉宽，单位 us */
-uint16_t Servo_GetPulse(void);
+/* 当前实际角度（含微调）/ 当前实际脉宽（写进 CCR 的值，单位 us） */
+uint16_t Servo_GetAngle(ServoId id);
+uint16_t Servo_GetPulse(ServoId id);
 
 #endif /* __SERVO_H */

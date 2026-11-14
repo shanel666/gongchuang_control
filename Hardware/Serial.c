@@ -200,12 +200,13 @@ void USART1_IRQHandler(void)
     {
         uint8_t RxData = USART_ReceiveData(USART1);
 
-        /* 状态机解析回包：帧头(地址 0x01~0x04) -> 3 字节数据 -> 包尾 0x6B
+        /* 状态机解析回包：帧头(地址 0x01~0x05) -> 3 字节数据 -> 包尾 0x6B
          * 回包格式：[地址][功能码][数据][校验 0x6B]
-         * 0x3A 查询回包：[地址][0x3A][状态][0x6B]，其中状态字节 0x03 表示已到位 */
+         * 0x3A 查询回包：[地址][0x3A][状态][0x6B]，其中状态 bit1 表示已到位
+         * （底盘 1~4 用 0x03 = 使能+到位；物料电机地址 5 的一圈标定也靠这包判断到位） */
         if (RxState == 0)
         {
-            if (RxData >= 0x01 && RxData <= 0x04)   /* 地址作为帧头 */
+            if (RxData >= 0x01 && RxData <= 0x05)   /* 地址作为帧头 */
             {
                 Serial_RxPacket[0] = RxData;
                 pRxPacket = 1;

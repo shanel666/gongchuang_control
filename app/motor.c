@@ -262,18 +262,24 @@ void motor_rotate_speed_stop(void)
     motor_rotate_speed(0x00, 0x0000);
 }
 
-/* 使能 4 个电机：[地址][F3][AB][01][同步][校验]，上电默认失能，移动前先调一次 */
+/* 使能一个地址：[地址][F3][AB][01][同步][校验]，上电默认失能，移动前先调一次 */
+void motor_enable_addr(uint8_t addr)
+{
+    Serial_SendByte(addr);
+    Serial_SendByte(0xF3);
+    Serial_SendByte(0xAB);
+    Serial_SendByte(0x01);
+    Serial_SendByte(0x00);
+    Serial_SendByte(0x6B);
+    Delay_ms(5);
+}
+
+/* 使能 4 个底盘电机（地址 1~4）。地址 5 这类额外电机用 motor_enable_addr() 单独使能。 */
 void motor_enable_all(void)
 {
     uint8_t i;
     for (i = 1; i <= 4; i++) {
-        Serial_SendByte(i);
-        Serial_SendByte(0xF3);
-        Serial_SendByte(0xAB);
-        Serial_SendByte(0x01);
-        Serial_SendByte(0x00);
-        Serial_SendByte(0x6B);
-        Delay_ms(5);
+        motor_enable_addr(i);
     }
 }
 volatile uint8_t uart_key_num = 0;

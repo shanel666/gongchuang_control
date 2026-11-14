@@ -1394,13 +1394,14 @@ static void wireless_test_run(void)
 
 #else
 
-/* 舵机角度按键标定：PA12 每按一次 +1°，PA11 每按一次 -1°，限幅 0~100°。 */
+/* 舵机角度按键标定：PA12 每按一次 +1°，PA11 每按一次 -1°，限幅 0~270°。
+ * 只动旋转舵机（PC9）；三路一起调请用 grab_run_once()。 */
 static void servo_angle_test(void)
 {
     uint8_t key;
-    int servo_angle = SERVO_ANGLE_OPEN;   /* 上电张开（38°），加紧为 44° */
+    int servo_angle = (int)SERVO_ROT_INIT_DEG;   /* 上电 240° */
 
-    Servo_SetAngle((uint16_t)servo_angle);
+    Servo_SetAngle(SERVO_ROT, (uint16_t)servo_angle);
     OLED_ShowString(1, 1, "ANGLE:");
     OLED_ShowNum(1, 7, (uint32_t)servo_angle, 3);
     OLED_ShowString(2, 1, "PA12:+1 PA11:-1");
@@ -1410,18 +1411,466 @@ static void servo_angle_test(void)
         if(key == 4){                                       /* PA12：+1° */
             if(servo_angle < (int)SERVO_ANGLE_MAX) servo_angle++;
         }else if(key == 5){                                 /* PA11：-1° */
-            if(servo_angle > 0) servo_angle--;
+            if(servo_angle > (int)SERVO_ANGLE_MIN) servo_angle--;
         }else{
             Delay_ms(10);
             continue;
         }
 
-        Servo_SetAngle((uint16_t)servo_angle);
+        Servo_SetAngle(SERVO_ROT, (uint16_t)servo_angle);
         OLED_ShowNum(1, 7, (uint32_t)servo_angle, 3);
     }
 }
 
 #endif /* DEBUG_MODE */
+
+/* ============================================================================
+ * 物料电机（地址 5）· 分度转动测试
+ * ----------------------------------------------------------------------------
+ * PA12：转 MATERIAL_DEG_PER_STEP 度 → 等驱动器到位 → 立即停止 → OLED 显示脉冲数
+ * PA11：运动过程中随时立即停止（转动中随时拍停）
+ *
+ * 标定结果：3200 脉冲 = 物料轴一整圈（已实测确认，按 PA12 转一圈正好）。
+ * 所以任意角度按下面公式换算：脉冲 = 3200 × 角度 / 360，60° → 533 脉冲。
+ * 想改成别的角度，只动 MATERIAL_DEG_PER_STEP（≤ 999 保证 OLED 不串行）：
+ *   90° → 800 脉冲，180° → 1600，360° → 3200（= 一整圈）。
+ * 注意 533 是四舍五入后的整数，连按 6 次共 3198 脉冲，比整圈少 2 个（约 0.2°）。
+ *
+ * OLED：第 1 行角度+地址，第 2 行本次脉冲，第 3 行上电以来累计脉冲，第 4 行状态。
+ * ========================================================================== */
+#define MATERIAL_MOTOR_ADDR      0x05u   /* 物料电机驱动器地址 */
+#define MATERIAL_MOTOR_DIR       0x00u   /* 0x00 正转 / 0x01 反转（转反了就改这里） */
+#define MATERIAL_MOTOR_SPEED     100u    /* 速度 RPM：0~3000，越大越快 */
+#define MATERIAL_MOTOR_ACCEL     200u    /* 加速度档 0~255（0 = 不用曲线加减速） */
+#define MATERIAL_PULSES_PER_REV  3200u   /* 实测值：物料轴转一整圈的脉冲数 */
+#define MATERIAL_DEG_PER_STEP    60u     /* ★ 每次按 PA12 转多少度 */
+#define MATERIAL_DEG_FULL        360u    /* 一整圈的角度，只用来做换算 */
+
+/* 标定界面第 4 行的状态 */
+#define MAT_CAL_IDLE       0u   /* 等按键 */
+#define MAT_CAL_MOVING     1u   /* 正在转 */
+#define MAT_CAL_DONE       2u   /* 驱动器回到位、已停 */
+#define MAT_CAL_NO_ANSWER  3u   /* 0x3A 没回包：驱动器不在线或关了应答 */
+#define MAT_CAL_ABORT      4u   /* PA11 中途叫停 */
+
+#define MAT_CAL_ROUND_MS   20u  /* 一次"查询 + 等待"大约 20 ms，用来算超时轮数 */
+
+static uint32_t material_total_pulses = 0;   /* 上电以来累计发出的脉冲数 */
+
+/* 角度 → 脉冲：3200 脉冲 = 360°，四舍五入（60° → 533，360° → 3200）。 */
+static uint32_t material_deg_to_pulses(uint32_t deg)
+{
+    return (MATERIAL_PULSES_PER_REV * deg + MATERIAL_DEG_FULL / 2u) / MATERIAL_DEG_FULL;
+}
+
+/* 给物料电机发一帧位置命令：相对位置、立即执行（单电机不需要同步释放帧）。 */
+static void material_motor_move(uint32_t pulses, uint8_t dir)
+{
+    uint8_t cmd[13] = {
+        MATERIAL_MOTOR_ADDR,
+        0xFD,                                            /* 位置模式 */
+        dir,
+        (uint8_t)(MATERIAL_MOTOR_SPEED >> 8),
+        (uint8_t)(MATERIAL_MOTOR_SPEED & 0xFFu),
+        (uint8_t)MATERIAL_MOTOR_ACCEL,
+        0x00, 0x00, 0x00, 0x00,                        /* 脉冲数，下面填 */
+        0x00,                                            /* 相对位置：从当前位置再走 pulses */
+        0x00,                                            /* 立即执行 */
+        0x6B
+    };
+
+    cmd[6] = (uint8_t)(pulses >> 24);
+    cmd[7] = (uint8_t)(pulses >> 16);
+    cmd[8] = (uint8_t)(pulses >> 8);
+    cmd[9] = (uint8_t)pulses;
+
+    Serial_SendArray(cmd, 13);
+    Delay_ms(5);
+
+    material_total_pulses += pulses;
+}
+
+/* 立即停止：[地址][0xFE][0x98][同步][0x6B]（Emm42 的"立即停止"命令）。 */
+static void material_motor_stop(void)
+{
+    Serial_SendByte(MATERIAL_MOTOR_ADDR);
+    Serial_SendByte(0xFE);
+    Serial_SendByte(0x98);
+    Serial_SendByte(0x00);
+    Serial_SendByte(0x6B);
+    Delay_ms(5);
+}
+
+/* 这一下要走多久 → 超时轮数：脉冲 ÷ (3200 脉冲/圈 × 速度RPM) 换算成毫秒，
+ * 再加 2 s 余量。3200 是驱动器细分决定的"电机一圈"，和上面按角度换算的脉冲无关，
+ * 所以角度/脉冲填大了，这里的超时也会跟着变长。 */
+static uint16_t material_calib_rounds(uint32_t pulses)
+{
+    uint32_t ms, rounds;
+
+    ms = (pulses / 4u) * 75u / MATERIAL_MOTOR_SPEED + 2000u;   /* 60000/3200 = 18.75 = 75/4 */
+    rounds = ms / MAT_CAL_ROUND_MS;
+
+    if(rounds < 100u)  rounds = 100u;    /* 至少 2 s，别刚发完就判超时 */
+    if(rounds > 3000u) rounds = 3000u;   /* 最多 60 s */
+
+    return (uint16_t)rounds;
+}
+
+/* 轮询 0x3A 到位状态：回包 [地址][0x3A][状态][0x6B]，状态 bit1 = 已到位。
+ * 返回 MAT_CAL_DONE / MAT_CAL_NO_ANSWER / MAT_CAL_ABORT。 */
+static uint8_t material_motor_wait_arrive(uint16_t max_rounds)
+{
+    uint16_t round;
+    uint8_t  i;
+
+    /* 刚发完命令时驱动器可能还留着上一轮的"到位"标志，先等它真正起步 */
+    Delay_ms(50);
+
+    for(round = 0; round < max_rounds; round++){
+        /* PA11 随时中止，避免参数填太大时一直转 */
+        if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) == Bit_RESET){
+            material_motor_stop();
+            while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) == Bit_RESET) Delay_ms(10);  /* 等松手 */
+            return MAT_CAL_ABORT;
+        }
+
+        Serial_RxFlag = 0;
+        Serial_RxPacket[0] = Serial_RxPacket[1] = Serial_RxPacket[2] = Serial_RxPacket[3] = 0;
+        Serial_SendByte(MATERIAL_MOTOR_ADDR);
+        Serial_SendByte(0x3A);
+        Serial_SendByte(0x6B);
+        for(i = 0; i < 10u; i++){
+            if(Serial_GetRxFlag()) break;
+            Delay_ms(1);
+        }
+
+        if(Serial_RxPacket[0] == MATERIAL_MOTOR_ADDR &&
+           Serial_RxPacket[1] == 0x3A &&
+           (Serial_RxPacket[2] & 0x02u) != 0u){
+            return MAT_CAL_DONE;
+        }
+
+        Delay_ms(10);
+    }
+
+    return MAT_CAL_NO_ANSWER;
+}
+
+static void material_calib_clear_line(uint8_t line)
+{
+    OLED_ShowString(line, 1, "                ");   /* 16 个空格，擦掉旧数字的尾巴 */
+}
+
+static uint8_t oled_digits(uint32_t v)
+{
+    uint8_t n = 1u;
+
+    while(v >= 10u){ v /= 10u; n++; }
+    return n;
+}
+
+/* 画标定界面：第 1 行角度，第 2 行本次脉冲，第 3 行累计脉冲，第 4 行状态。
+ * 角度最多 3 位（≤999°）才能和 "DEG ADDR5" 拼在 16 列内。 */
+static void material_calib_draw(uint8_t state)
+{
+    uint8_t  n;
+    uint32_t step = material_deg_to_pulses(MATERIAL_DEG_PER_STEP);
+
+    n = oled_digits(MATERIAL_DEG_PER_STEP);
+    OLED_ShowString(1, 1, "MAT ");
+    OLED_ShowNum(1, 5, MATERIAL_DEG_PER_STEP, n);
+    OLED_ShowString(1, (uint8_t)(5u + n), "DEG ADDR5");
+
+    /* 标签 5 列 + 数字最多 10 列 + "P" = 16 列，正好不出屏 */
+    material_calib_clear_line(2);
+    OLED_ShowString(2, 1, "STEP:");
+    OLED_ShowNum(2, 6, step, oled_digits(step));
+    OLED_ShowString(2, (uint8_t)(6u + oled_digits(step)), "P");
+
+    material_calib_clear_line(3);
+    OLED_ShowString(3, 1, "TOTAL:");
+    OLED_ShowNum(3, 7, material_total_pulses, oled_digits(material_total_pulses));
+
+    switch(state){
+        case MAT_CAL_MOVING:    OLED_ShowString(4, 1, "MOVING...       "); break;
+        case MAT_CAL_DONE:      OLED_ShowString(4, 1, "OK STOPPED      "); break;
+        case MAT_CAL_NO_ANSWER: OLED_ShowString(4, 1, "NO 3A ANSWER    "); break;
+        case MAT_CAL_ABORT:     OLED_ShowString(4, 1, "STOP BY PA11    "); break;
+        default:                OLED_ShowString(4, 1, "PA12: TURN STEP "); break;
+    }
+}
+
+/* 分度转动主循环：不返回。 */
+static void material_calib_test(void)
+{
+    uint8_t  key, state;
+    uint32_t step;
+
+    /* 地址 5 不在 motor_enable_all() 的 1~4 里，失能状态下运动命令会被忽略 */
+    motor_enable_addr(MATERIAL_MOTOR_ADDR);
+
+    step = material_deg_to_pulses(MATERIAL_DEG_PER_STEP);
+
+    OLED_Clear();
+    material_calib_draw(MAT_CAL_IDLE);
+
+    while(1){
+        key = Key_GetNum();
+
+        /* 只认 PA12（键码 4）；PA11 是运动中的停止键，空闲时按下忽略 */
+        if(key != 4u || step == 0u){
+            Delay_ms(10);
+            continue;
+        }
+
+        material_motor_move(step, MATERIAL_MOTOR_DIR);
+        material_calib_draw(MAT_CAL_MOVING);
+
+        state = material_motor_wait_arrive(material_calib_rounds(step));
+        if(state == MAT_CAL_DONE) material_motor_stop();   /* 到位后再补一发立即停止 */
+        material_calib_draw(state);
+    }
+}
+
+/* ============================================================================
+ * 270° 舵机（PC9 = TIM3_CH4）按键标定
+ * ----------------------------------------------------------------------------
+ * PA12：角度 +SERVO_STEP_DEG      PA11：角度 -SERVO_STEP_DEG
+ * 越界时（已在 270° 还按 +，或已在 0° 还按 -）什么都不做：
+ *   不发新的 CCR、也不重画 OLED —— 屏幕上的角度/脉宽保持上一次的数值。
+ * 脉宽映射见 Servo.h：0° → 500 us，270° → 2500 us，20 ms 周期（50 Hz）。
+ * OLED 第 2 行是目标角度，第 3 行是实际写进 CCR 的脉宽（和硬件输出一致）。
+ * ========================================================================== */
+#define SERVO_STEP_DEG   10u
+
+/* 画界面：angle 是当前目标角度，脉宽直接取 Servo_GetPulse(SERVO_ROT)，避免两处各算一遍。 */
+static void servo270_draw(uint16_t angle)
+{
+    uint16_t pulse = Servo_GetPulse(SERVO_ROT);
+    uint8_t  n;
+
+    OLED_ShowString(1, 1, "SERVO PC9  270D");
+
+    /* 第 2 行角度：先擦整行再画，数字位数变化不会留尾巴 */
+    OLED_ShowString(2, 1, "                ");
+    OLED_ShowString(2, 1, "ANG:");
+    n = oled_digits(angle);
+    OLED_ShowNum(2, 5, angle, n);
+    OLED_ShowString(2, (uint8_t)(5u + n), "D");
+
+    /* 第 3 行脉宽 */
+    OLED_ShowString(3, 1, "                ");
+    OLED_ShowString(3, 1, "PULSE:");
+    n = oled_digits(pulse);
+    OLED_ShowNum(3, 7, pulse, n);
+    OLED_ShowString(3, (uint8_t)(7u + n), "us");
+
+    OLED_ShowString(4, 1, "A12:+10 A11:-10 ");
+}
+
+/* 270° 舵机按键标定主循环：不返回。 */
+static void servo270_test(void)
+{
+    uint8_t  key;
+    uint16_t angle = SERVO_ANGLE_MIN;   /* 从 0° 开始，方便对照实物 */
+
+    Servo_SetAngle(SERVO_ROT, angle);
+    OLED_Clear();
+    servo270_draw(angle);
+
+    while(1){
+        key = Key_GetNum();
+
+        if(key == 4u){                                  /* PA12：+10° */
+            if((uint32_t)angle + SERVO_STEP_DEG > SERVO_ANGLE_MAX){
+                Delay_ms(10);
+                continue;                               /* 到顶：PWM、OLED 都不动 */
+            }
+            angle = (uint16_t)(angle + SERVO_STEP_DEG);
+        }else if(key == 5u){                            /* PA11：-10° */
+            if(angle < SERVO_STEP_DEG){
+                Delay_ms(10);
+                continue;                               /* 到底：PWM、OLED 都不动 */
+            }
+            angle = (uint16_t)(angle - SERVO_STEP_DEG);
+        }else{
+            Delay_ms(10);
+            continue;
+        }
+
+        Servo_SetAngle(SERVO_ROT, angle);
+        servo270_draw(angle);
+    }
+}
+
+/* ============================================================================
+ * 夹取物料调试动作（升降舵机 PC7 / 夹爪舵机 PC8 / 旋转舵机 PC9）
+ * ----------------------------------------------------------------------------
+ * 上电安全位：旋转 240°、升降 90°、夹爪 65°（Servo_Init 直接输出，见 Servo.h）。
+ * PA8 按一次 = 跑完整套动作；跑完停在最后一步，不自动回初始位。
+ *   1) 升降 90° → 70°    贴近地面
+ *   2) 夹爪 65° → 110°   夹起物料
+ *   3) 升降 70° → 170°   抬高物料
+ *   4) 旋转 240° → 80°   转到车上
+ *   5) 夹爪 110° → 60°   放开物料
+ * PA11：动作途中按下 = 立即中止，后续步骤不再执行，停在当前姿势。
+ * 每步之后等 GRAB_SETTLE_MS 让舵机转到位；等待期间 PA11 每 1 ms 查一次，照样能打断。
+ * 地址 5（物料盘电机）和地址 6（升降步进电机）本动作完全不碰。
+ * ========================================================================== */
+#define GRAB_SETTLE_MS   800u
+
+typedef struct {
+    ServoId  id;          /* 哪个舵机 */
+    uint16_t deg;         /* 目标角度 */
+    char     label[8];    /* OLED / 串口显示用，最多 7 个字符 */
+} GrabStep;
+
+static const GrabStep k_grab_steps[] = {
+    { SERVO_LIFT,  70u, "LIFT70"  },
+    { SERVO_GRIP, 110u, "GRIP110" },
+    { SERVO_LIFT, 170u, "LIFT170" },
+    { SERVO_ROT,   80u, "ROT80"   },
+    { SERVO_GRIP,  60u, "GRIP60"  }
+};
+
+#define GRAB_STEP_COUNT   ((uint8_t)(sizeof(k_grab_steps) / sizeof(k_grab_steps[0])))
+
+/* 界面状态（第 4 行） */
+#define GRAB_READY   0u
+#define GRAB_BUSY    1u
+#define GRAB_DONE    2u
+#define GRAB_ABORT   3u
+
+/* PA8 当启动键：上拉输入，按下接地。Key_GetNum() 只扫 PB1/PB11/PB10/PA12/PA11，
+ * 所以 PA8 在这里单独初始化、单独读。 */
+static void grab_key_init(void)
+{
+    GPIO_InitTypeDef gpio;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
+    gpio.GPIO_Pin   = GPIO_Pin_8;
+    gpio.GPIO_Mode  = GPIO_Mode_IPU;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &gpio);
+}
+
+/* PA8 按了一下：20 ms 消抖 + 等松手，有按下返回 1 */
+static uint8_t grab_start_hit(void)
+{
+    if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) != Bit_RESET) return 0;
+
+    Delay_ms(20);
+    if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) != Bit_RESET) return 0;
+
+    while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET) Delay_ms(10);
+    Delay_ms(20);
+    return 1;
+}
+
+/* PA11 中止键：按下后等松手再返回 1，避免一直按着被重复判定 */
+static uint8_t grab_abort_hit(void)
+{
+    if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) != Bit_RESET) return 0;
+
+    while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) == Bit_RESET) Delay_ms(5);
+    return 1;
+}
+
+/* 等 ms 毫秒；期间 PA11 按下立刻返回 0（中止本次动作） */
+static uint8_t grab_wait(uint16_t ms)
+{
+    uint16_t t;
+
+    for(t = 0; t < ms; t++){
+        if(grab_abort_hit()) return 0;
+        Delay_ms(1);
+    }
+    return 1;
+}
+
+/* 画界面：step = 已完成/正在做的步数（0 = 还没开始），state 决定第 4 行。
+ * 第 2、3 行显示的是三个舵机的实际角度（含微调），不是目标角度。 */
+static void grab_show(uint8_t step, uint8_t state)
+{
+    /* 第 1 行：GRAB 2/5 GRIP110 */
+    OLED_ShowString(1, 1, "                ");
+    OLED_ShowString(1, 1, "GRAB ");
+    OLED_ShowNum(1, 6, step, 1);
+    OLED_ShowString(1, 7, "/5");
+    if(step > 0u){
+        OLED_ShowString(1, 10, (char *)k_grab_steps[step - 1u].label);
+    }
+
+    /* 第 2 行：ROT:240 LFT:170 （角度最多 3 位，列位置固定，不会串行） */
+    OLED_ShowString(2, 1, "                ");
+    OLED_ShowString(2, 1, "ROT:");
+    OLED_ShowNum(2, 5, Servo_GetAngle(SERVO_ROT), oled_digits(Servo_GetAngle(SERVO_ROT)));
+    OLED_ShowString(2, 9, "LFT:");
+    OLED_ShowNum(2, 13, Servo_GetAngle(SERVO_LIFT), oled_digits(Servo_GetAngle(SERVO_LIFT)));
+
+    /* 第 3 行：GRP:65 */
+    OLED_ShowString(3, 1, "                ");
+    OLED_ShowString(3, 1, "GRP:");
+    OLED_ShowNum(3, 5, Servo_GetAngle(SERVO_GRIP), oled_digits(Servo_GetAngle(SERVO_GRIP)));
+
+    switch(state){
+        case GRAB_BUSY:  OLED_ShowString(4, 1, "BUSY...         "); break;
+        case GRAB_DONE:  OLED_ShowString(4, 1, "DONE            "); break;
+        case GRAB_ABORT: OLED_ShowString(4, 1, "ABORT BY PA11   "); break;
+        default:         OLED_ShowString(4, 1, "PA8:START       "); break;
+    }
+}
+
+/* 夹取动作主循环：不返回。 */
+static void grab_run_once(void)
+{
+    uint8_t i, step, ok;
+
+    /* 上电安全位（Servo_Init 里已经输出过，这里再确认一次，重进本函数时也一致） */
+    Servo_SetAngle(SERVO_ROT,  SERVO_ROT_INIT_DEG);
+    Servo_SetAngle(SERVO_LIFT, SERVO_LIFT_INIT_DEG);
+    Servo_SetAngle(SERVO_GRIP, SERVO_GRIP_INIT_DEG);
+
+    grab_key_init();
+
+    OLED_Clear();
+    grab_show(0u, GRAB_READY);
+    USART3_SendString("\r\nGRAB READY: PA8=START PA11=ABORT\r\n");
+
+    while(1){
+        if(!grab_start_hit()){
+            Delay_ms(5);
+            continue;
+        }
+
+        USART3_SendString("[RUN] START\r\n");
+        step = 0u;
+        ok   = 1u;
+
+        for(i = 0; i < GRAB_STEP_COUNT; i++){
+            step = (uint8_t)(i + 1u);
+
+            Servo_SetAngle(k_grab_steps[i].id, k_grab_steps[i].deg);
+            grab_show(step, GRAB_BUSY);
+            USART3_Printf("[S%u] %s -> %u deg\r\n",
+                          (unsigned)step, k_grab_steps[i].label,
+                          (unsigned)k_grab_steps[i].deg);
+
+            if(!grab_wait(GRAB_SETTLE_MS)){
+                ok = 0u;                 /* PA11 中止：停在当前姿势 */
+                break;
+            }
+        }
+
+        grab_show(step, ok ? GRAB_DONE : GRAB_ABORT);
+        USART3_SendString(ok ? "[RUN] DONE\r\n" : "[RUN] ABORT BY PA11\r\n");
+
+        /* 收尾：等 PA8 松手。否则"一直按住 PA8"会在动作结束后立刻再跑一遍。 */
+        while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET) Delay_ms(10);
+    }
+}
+
 
 int main(void)
 {
@@ -1431,7 +1880,7 @@ int main(void)
 	
 	s32 yaw_centi_degrees = 0, last_yaw_centi_degrees = 0;
     LED_Init();
-    Servo_Init();             /* PC8(TIM3_CH3) 舵机 PWM，上电默认张开 38° */
+    Servo_Init();             /* PC7/PC8/PC9 三路舵机 PWM，上电输出安全角度 240/90/65 */
     OLED_Init();
     Key_Init();
     Serial_Init();
@@ -1453,6 +1902,11 @@ int main(void)
 	/* 电机上电默认失能（F3 使能帧之前所有运动指令都会被忽略），
 	 * 任何会驱动底盘的模式都必须先使能，否则车一动不动。 */
 	motor_enable_all();
+
+	/* 夹取物料调试动作：PA8 启动整套动作，PA11 中途中止，OLED 显示当前步骤和三个舵机角度。
+	 * 这是临时测试，排在调试模式派发之前，所以下面的 DEBUG_MODE 分支暂时都走不到；
+	 * 想回去测物料电机 / 单个舵机就换成 material_calib_test() / servo270_test()。 */
+	grab_run_once();
 
 	/* 调试模式派发：各模式函数内部都是死循环，正常情况下不会返回。
 	 * 切换模式改文件上方的 DEBUG_MODE 即可。 */

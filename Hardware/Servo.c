@@ -2,9 +2,10 @@
 #include "Servo.h"
 
 /*
- * PC8 的定时器复用关系：
+ * PC7 / PC8 / PC9 的定时器复用关系：
  *   TIM3_CH1/CH2/CH3/CH4 默认在 PA6/PA7/PB0/PB1，
- *   完全重映射后为 PC6/PC7/PC8/PC9，所以 PC8 = TIM3_CH3。
+ *   完全重映射后为 PC6/PC7/PC8/PC9，所以：
+ *     PC7 = TIM3_CH2（升降）、PC8 = TIM3_CH3（夹爪）、PC9 = TIM3_CH4（旋转）。
  *
  * 时基：TIM3 时钟 72 MHz，预分频 72 -> 计数频率 1 MHz（1 个计数 = 1 us），
  *       ARR = 20000 - 1 -> 周期 20 ms（50 Hz），CCR 即高电平脉宽 us 数。
@@ -14,33 +15,103 @@
 #define SERVO_TIM_CLK       RCC_APB1Periph_TIM3
 #define SERVO_GPIO_CLK      RCC_APB2Periph_GPIOC
 #define SERVO_GPIO_PORT     GPIOC
-#define SERVO_GPIO_PIN      GPIO_Pin_8
+#define SERVO_GPIO_PIN      (GPIO_Pin_7 | GPIO_Pin_8 | GPIO_Pin_9)
 
 #define SERVO_PERIOD_US     20000u  /* 20 ms */
 #define SERVO_TIM_PSC       (72u - 1u)
 
-/* 上电初始脉宽 = 张开角度对应的脉宽，保证 PWM 一启动就是张开状态 */
-static uint16_t servo_pulse_us = (uint16_t)SERVO_ANGLE_TO_PULSE(SERVO_ANGLE_OPEN);
+/* 每路舵机：定时器通道、上电角度、角度微调（下标就是 ServoId） */
+static const uint8_t  k_servo_ch[SERVO_COUNT]   = {4u, 2u, 3u};   /* ROT=CH4 / LIFT=CH2 / GRIP=CH3 */
+static const uint16_t k_servo_init[SERVO_COUNT] = {
+    SERVO_ROT_INIT_DEG, SERVO_LIFT_INIT_DEG, SERVO_GRIP_INIT_DEG
+};
+static const int16_t  k_servo_trim[SERVO_COUNT] = {
+    SERVO_TRIM_ROT, SERVO_TRIM_LIFT, SERVO_TRIM_GRIP
+};
+
+static uint16_t servo_angle[SERVO_COUNT];   /* 实际角度（含微调） */
+static uint16_t servo_pulse[SERVO_COUNT];   /* 实际脉宽，单位 us */
+
+/* 角度 -> 脉宽：500 + 2000 * deg / 270，四舍五入 */
+static uint16_t servo_deg_to_pulse(uint16_t deg)
+{
+	uint32_t pulse;
+
+	if (deg > SERVO_ANGLE_MAX) deg = SERVO_ANGLE_MAX;
+
+	pulse = SERVO_MIN_PULSE_US +
+	        ((uint32_t)(SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) * (uint32_t)deg
+	         + SERVO_ANGLE_MAX / 2u) / SERVO_ANGLE_MAX;
+
+	if (pulse < SERVO_MIN_PULSE_US) pulse = SERVO_MIN_PULSE_US;
+	if (pulse > SERVO_MAX_PULSE_US) pulse = SERVO_MAX_PULSE_US;
+
+	return (uint16_t)pulse;
+}
+
+/* 通道初始化：PWM 模式 1、高电平有效、CCR 预装载 */
+static void servo_ch_init(uint8_t ch, uint16_t pulse)
+{
+	TIM_OCInitTypeDef oc;
+
+	TIM_OCStructInit(&oc);
+	oc.TIM_OCMode      = TIM_OCMode_PWM1;
+	oc.TIM_OutputState = TIM_OutputState_Enable;
+	oc.TIM_OCPolarity  = TIM_OCPolarity_High;
+	oc.TIM_Pulse       = pulse;
+
+	switch (ch)
+	{
+		case 2u:
+			TIM_OC2Init(SERVO_TIM, &oc);
+			TIM_OC2PreloadConfig(SERVO_TIM, TIM_OCPreload_Enable);
+			break;
+		case 3u:
+			TIM_OC3Init(SERVO_TIM, &oc);
+			TIM_OC3PreloadConfig(SERVO_TIM, TIM_OCPreload_Enable);
+			break;
+		case 4u:
+			TIM_OC4Init(SERVO_TIM, &oc);
+			TIM_OC4PreloadConfig(SERVO_TIM, TIM_OCPreload_Enable);
+			break;
+		default:
+			break;
+	}
+}
+
+/* 写 CCR：1 个计数 = 1 us，所以 CCR 就是脉宽 */
+static void servo_ch_set(uint8_t ch, uint16_t pulse)
+{
+	switch (ch)
+	{
+		case 2u: TIM_SetCompare2(SERVO_TIM, (uint32_t)pulse); break;
+		case 3u: TIM_SetCompare3(SERVO_TIM, (uint32_t)pulse); break;
+		case 4u: TIM_SetCompare4(SERVO_TIM, (uint32_t)pulse); break;
+		default: break;
+	}
+}
 
 /**
-  * 函    数：舵机PWM初始化
+  * 函    数：三路舵机 PWM 初始化
   * 参    数：无
   * 返 回 值：无
+  * 说    明：初始化完成立即输出安全角度（旋转 240°/升降 90°/夹爪 65°）
   */
 void Servo_Init(void)
 {
 	GPIO_InitTypeDef GPIO_InitStructure;
 	TIM_TimeBaseInitTypeDef TIM_TimeBaseInitStructure;
-	TIM_OCInitTypeDef TIM_OCInitStructure;
+	uint8_t i;
+	int32_t d;
 
 	/*开启时钟：GPIO + 复用功能重映射 + TIM3*/
 	RCC_APB2PeriphClockCmd(SERVO_GPIO_CLK | RCC_APB2Periph_AFIO, ENABLE);
 	RCC_APB1PeriphClockCmd(SERVO_TIM_CLK, ENABLE);
 
-	/*TIM3 完全重映射，CH3 输出到 PC8*/
+	/*TIM3 完全重映射：CH2/CH3/CH4 输出到 PC7/PC8/PC9*/
 	GPIO_PinRemapConfig(GPIO_FullRemap_TIM3, ENABLE);
 
-	/*PC8 配置为复用推挽输出*/
+	/*PC7/PC8/PC9 配置为复用推挽输出*/
 	GPIO_InitStructure.GPIO_Pin = SERVO_GPIO_PIN;
 	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
 	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
@@ -54,80 +125,64 @@ void Servo_Init(void)
 	TIM_TimeBaseInitStructure.TIM_RepetitionCounter = 0;
 	TIM_TimeBaseInit(SERVO_TIM, &TIM_TimeBaseInitStructure);
 
-	/*CH3 PWM 模式 1：CNT < CCR 时输出高电平*/
-	TIM_OCStructInit(&TIM_OCInitStructure);
-	TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
-	TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
-	TIM_OCInitStructure.TIM_OCPolarity = TIM_OCPolarity_High;
-	TIM_OCInitStructure.TIM_Pulse = servo_pulse_us;   /* 1 个计数 = 1 us，CCR 即脉宽 */
-	TIM_OC3Init(SERVO_TIM, &TIM_OCInitStructure);
+	/*三路一起初始化：先把安全角度算好，PWM 一使能就是安全姿态*/
+	for (i = 0; i < (uint8_t)SERVO_COUNT; i++)
+	{
+		d = (int32_t)k_servo_init[i] + (int32_t)k_servo_trim[i];
+		if (d < (int32_t)SERVO_ANGLE_MIN) d = (int32_t)SERVO_ANGLE_MIN;
+		if (d > (int32_t)SERVO_ANGLE_MAX) d = (int32_t)SERVO_ANGLE_MAX;
 
-	/*CCR 预装载，改脉宽时在下一个周期生效，避免出现畸形脉冲*/
-	TIM_OC3PreloadConfig(SERVO_TIM, TIM_OCPreload_Enable);
+		servo_angle[i] = (uint16_t)d;
+		servo_pulse[i] = servo_deg_to_pulse(servo_angle[i]);
+		servo_ch_init(k_servo_ch[i], servo_pulse[i]);
+	}
+
+	/*ARR 预装载，改周期也在下一个周期生效*/
 	TIM_ARRPreloadConfig(SERVO_TIM, ENABLE);
 
 	TIM_Cmd(SERVO_TIM, ENABLE);
 }
 
 /**
-  * 函    数：设置舵机脉宽
-  * 参    数：pulse_us 高电平时间，500~2500，单位 us
+  * 函    数：设置某一路舵机角度
+  * 参    数：id  舵机编号（SERVO_ROT / SERVO_LIFT / SERVO_GRIP）
+  *           deg 目标角度，0~270，超出自动限幅
   * 返 回 值：无
   */
-void Servo_SetPulse(uint16_t pulse_us)
+void Servo_SetAngle(ServoId id, uint16_t deg)
 {
-	if (pulse_us < SERVO_MIN_PULSE_US) pulse_us = SERVO_MIN_PULSE_US;
-	if (pulse_us > SERVO_MAX_PULSE_US) pulse_us = SERVO_MAX_PULSE_US;
+	int32_t d;
 
-	servo_pulse_us = pulse_us;
-	TIM_SetCompare3(SERVO_TIM, (uint32_t)pulse_us);
+	if ((uint8_t)id >= (uint8_t)SERVO_COUNT) return;
+
+	d = (int32_t)deg + (int32_t)k_servo_trim[id];          /* 加现场微调 */
+	if (d < (int32_t)SERVO_ANGLE_MIN) d = (int32_t)SERVO_ANGLE_MIN;
+	if (d > (int32_t)SERVO_ANGLE_MAX) d = (int32_t)SERVO_ANGLE_MAX;
+
+	servo_angle[id] = (uint16_t)d;
+	servo_pulse[id] = servo_deg_to_pulse((uint16_t)d);
+
+	servo_ch_set(k_servo_ch[id], servo_pulse[id]);
 }
 
 /**
-  * 函    数：设置舵机角度
-  * 参    数：angle_deg 角度，0~SERVO_ANGLE_MAX，单位 度
-  * 返 回 值：无
+  * 函    数：读取某一路舵机当前角度（含微调）
+  * 参    数：id 舵机编号
+  * 返 回 值：实际角度，单位 度；id 非法时返回 0
   */
-void Servo_SetAngle(uint16_t angle_deg)
+uint16_t Servo_GetAngle(ServoId id)
 {
-	uint32_t pulse;
-
-	if (angle_deg > SERVO_ANGLE_MAX) angle_deg = SERVO_ANGLE_MAX;
-
-	/* 500 + 2000 * angle / ANGLE_MAX，四舍五入 */
-	pulse = SERVO_MIN_PULSE_US +
-	        ((uint32_t)(SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) * angle_deg
-	         + SERVO_ANGLE_MAX / 2u) / SERVO_ANGLE_MAX;
-
-	Servo_SetPulse((uint16_t)pulse);
+	if ((uint8_t)id >= (uint8_t)SERVO_COUNT) return 0u;
+	return servo_angle[id];
 }
 
 /**
-  * 函    数：夹爪张开（38°）
-  * 参    数：无
-  * 返 回 值：无
+  * 函    数：读取某一路舵机当前脉宽
+  * 参    数：id 舵机编号
+  * 返 回 值：实际写进 CCR 的脉宽，单位 us；id 非法时返回 0
   */
-void Servo_Open(void)
+uint16_t Servo_GetPulse(ServoId id)
 {
-	Servo_SetAngle(SERVO_ANGLE_OPEN);
-}
-
-/**
-  * 函    数：夹爪加紧（44°）
-  * 参    数：无
-  * 返 回 值：无
-  */
-void Servo_Clamp(void)
-{
-	Servo_SetAngle(SERVO_ANGLE_CLAMP);
-}
-
-/**
-  * 函    数：读取当前脉宽
-  * 参    数：无
-  * 返 回 值：当前高电平脉宽，单位 us
-  */
-uint16_t Servo_GetPulse(void)
-{
-	return servo_pulse_us;
+	if ((uint8_t)id >= (uint8_t)SERVO_COUNT) return 0u;
+	return servo_pulse[id];
 }

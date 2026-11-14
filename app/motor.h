@@ -80,6 +80,9 @@ void motor_rotate_speed_stop(void);
 
 /* 使能 4 个电机：上电默认失能，移动前先调一次 */
 void motor_enable_all(void);
+
+/* 使能单个地址（1~4 之外的电机，比如物料电机地址 5）：失能状态下运动命令会被忽略 */
+void motor_enable_addr(uint8_t addr);
 extern volatile uint8_t uart_key_num;
 extern int32_t  pos_now;    // 电机当前位置（有符号）
 extern int32_t  pos_memo;    // 记忆位置（有符号）
