@@ -62,6 +62,20 @@ NG_EVERY_MS   = 500     # 没找到时多久回一次 NG（别刷屏）
 # ============================ 二、图像 ============================
 LCD_W = 800
 LCD_H = 480
+
+# ---- 屏幕 ----
+# 立创·庐山派 K230 的 3.1 寸 MIPI 屏是**扩展板**（不在主板上），HDMI 也是扩展板。
+#   没接屏幕 -> Display.init 会失败或什么都不显示，这是正常的，串口照样工作。
+#   想看画面有两种办法：
+#     a) USE_DISPLAY = True 且接了屏：直接看屏
+#     b) USE_DISPLAY = True 但不接屏：CanMV IDE 里那个帧缓冲窗口也能看（to_ide=True）
+#   只想稳定跑串口、不想被显示拖累：USE_DISPLAY = False
+USE_DISPLAY  = True
+LCD_DRIVER   = "ST7701"    # 3.1 寸 MIPI 屏用 ST7701；HDMI 扩展板改成 "LT9611"
+
+# 画面中心（640×480 的中心）。K230 屏上会画一个十字，方便肉眼对比偏差。
+IMG_CX = 320
+IMG_CY = 240
 IMG_W = 640
 IMG_H = 480
 
@@ -104,6 +118,7 @@ MODE_LINEAR = "linear"
 VERSION = "圆线串口 v1（circle / linear 命令版）"
 
 UART_OBJ = None        # 全局留着，退出时统一 deinit（省得下次重跑串口说"已被占用"）
+DISPLAY_OK = False     # 显示初始化成功才画屏；没接屏就一路跳过，串口不受影响
 
 _DIR8 = [(1.0, 0.0), (0.7071, 0.7071), (0.0, 1.0), (-0.7071, 0.7071),
          (-1.0, 0.0), (-0.7071, -0.7071), (0.0, -1.0), (0.7071, -0.7071)]
@@ -559,14 +574,50 @@ def close_uart():
     UART_OBJ = None
 
 
+def show(img):
+    """把画面送到屏 / IDE 帧缓冲。没屏或出错就静默跳过 —— 绝不影响串口。"""
+    global DISPLAY_OK
+    if not DISPLAY_OK:
+        return
+
+    # 画面中心画个黄十字：肉眼就能看出圆心离中心多远
+    try:
+        img.draw_cross(IMG_CX, IMG_CY, color=(255, 255, 0), size=10, thickness=2)
+    except Exception:
+        pass
+
+    try:
+        Display.show_image(img,
+                           x=round((LCD_W - img.width()) / 2),
+                           y=round((LCD_H - img.height()) / 2))
+    except Exception as e:
+        DISPLAY_OK = False
+        print("show_image 失败，后面不再画屏（串口继续）：", e)
+
+
 def main():
     global UART_OBJ
+    global DISPLAY_OK
+
     sensor = Sensor(width=1280, height=960)
     sensor.reset()
     sensor.set_framesize(width=IMG_W, height=IMG_H)
     sensor.set_pixformat(Sensor.RGB565)
 
-    Display.init(Display.ST7701, width=LCD_W, height=LCD_H, to_ide=True)
+    # ---- 显示：接不上屏也不能影响串口 ----
+    DISPLAY_OK = False
+    if USE_DISPLAY:
+        try:
+            drv = getattr(Display, LCD_DRIVER, Display.ST7701)
+            Display.init(drv, width=LCD_W, height=LCD_H, to_ide=True)
+            DISPLAY_OK = True
+            print("显示已初始化：%s %dx%d（画面同时送到 IDE 帧缓冲窗口）"
+                  % (LCD_DRIVER, LCD_W, LCD_H))
+        except Exception as e:
+            print("显示初始化失败：%s" % e)
+            print("  -> 没接 3.1 寸屏 / HDMI 扩展板时这是正常的，串口继续工作。")
+            print("  -> 想看画面：接屏，或用 CanMV IDE 的帧缓冲窗口。")
+
     MediaManager.init()
     sensor.run()
     clock = time.clock()
@@ -575,6 +626,7 @@ def main():
     UART_OBJ = u
     print("=== %s ===" % VERSION)
     print("  等主控发 circle / linear / stop")
+    print("  串口在跑的时候，IDE 里会打印 [cmd] 和每一帧回包，这就是 K230 看到的东西")
 
     mode = MODE_IDLE
     rx_state = new_rx_state()
@@ -609,9 +661,7 @@ def main():
         if mode == MODE_IDLE:
             draw_label(img, 0, 0, "IDLE  wait for cmd", (255, 255, 0), 22)
             draw_label(img, 0, 28, "circle / linear", (200, 200, 200), 20)
-            Display.show_image(img,
-                               x=round((LCD_W - sensor.width()) / 2),
-                               y=round((LCD_H - sensor.height()) / 2))
+            show(img)
             continue
 
         # ---------- 2) 灰度源图（每轮阈值都从它复制） ----------
@@ -730,14 +780,11 @@ def main():
                 last_reply = reply
             print("[%s] %s  %s" % (mode, reply, info))
 
-        # ---------- 5) 画面 ----------
+        # ---------- 5) 画面（屏 + IDE 帧缓冲）----------
         draw_label(img, 0, 0, "%s  %s" % (mode.upper(), last_reply),
                    (0, 255, 0), 22)
         draw_label(img, 0, 28, info, (255, 255, 255), 18)
-
-        Display.show_image(img,
-                           x=round((LCD_W - sensor.width()) / 2),
-                           y=round((LCD_H - sensor.height()) / 2))
+        show(img)
 
 
 if __name__ == "__main__":

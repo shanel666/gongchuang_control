@@ -78,6 +78,15 @@ uint32_t motor_rotate_centideg(uint8_t dir, int32_t centi);
 void motor_rotate_speed(uint8_t direction, uint16_t rpm);
 void motor_rotate_speed_stop(void);
 
+/* ★ 运行时改 FD 位置模式的速度和加速度（梯形加减速）。
+ *   默认用 motor.c 里的 MOTOR_SPEED(70) / MOTOR_ACCEL(200)，那是"正常跑"的值；
+ *   视觉闭环需要"很慢很慢 + 软斜坡"时先调一次：
+ *       motor_set_profile(8u, 20u);   // 8 RPM、加速度档 20（斜坡很缓）
+ *   传 0 表示恢复默认。只影响前后左右/旋转这七个动作，不影响点动和 F6。 */
+void motor_set_profile(uint16_t speed_rpm, uint16_t accel);
+uint16_t motor_get_speed(void);
+uint16_t motor_get_accel(void);
+
 /* 使能 4 个电机：上电默认失能，移动前先调一次 */
 void motor_enable_all(void);
 

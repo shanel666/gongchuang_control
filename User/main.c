@@ -1742,8 +1742,9 @@ static void servo270_test(void)
 #define GRAB_MOTOR_SETTLE_MS  1000u   /* 升降电机每步等待（30 RPM 走 1000 脉冲约 0.63 s） */
 
 #define LIFT_MOTOR_ADDR       0x06u   /* 升降步进电机地址 */
-#define LIFT_MOTOR_SPEED      30u     /* 速度 RPM，和 motor.c 的点动默认速度一致 */
-#define LIFT_MOTOR_ACCEL      100u    /* 加速度档 */
+#define LIFT_MOTOR_SPEED      40u     /* 速度 RPM。60 太快，电流冲击大（会把 K230 拉重启），
+                                       * 降到 40；9000 脉冲约 4.2 s 走完 */
+#define LIFT_MOTOR_ACCEL      80u     /* 加速度档（原来 150；越小斜坡越缓，起步电流越小） */
 #define LIFT_MOTOR_HOME       0u      /* 上电位置 = 绝对 0 */
 #define LIFT_MOTOR_UP         2000u   /* 升高 2000 脉冲 */
 
@@ -2480,7 +2481,8 @@ static void car_move_test(void)
 
 /* ============================================================================
  * USART2 引脚自检（测试 PA2 = TX、PA3 = RX 是不是好的）
- * ----------------------------------------------------------------------------
+ * --------------------------------------------------------------------
+ --------
  * 做三件事：
  *   1) 电气自检：把 PA2/PA3 依次配成上拉、下拉再读回。
  *      正常引脚会跟随（上拉读到 1、下拉读到 0）；一直读 0 = 短地/损坏。
@@ -2969,28 +2971,170 @@ static void pc13_uart_test(void)
 
 
 /* ============================================================================
- * 视觉链路测试（主控 <-> K230）—— 本模式**不动任何电机和舵机**，只发命令、只看数据
+ * 视觉闭环（主控 <-> K230）—— v2：会真的动电机，注意安全
  * ----------------------------------------------------------------------------
- * 主控发一行字符串命令，K230 回数据，主控把数据画在 OLED 上：
- *   PB1 发 "circle"  → K230 找圆心，回 C<x>,<y>,<r>   → 显示 X / Y / R
- *   PA7 发 "linear"  → K230 找直线，回 L<k>,<psi>     → 显示 k / psi
- *   PA5 发 "stop"    → 让 K230 停止回发
- * 按键是"按下为高"，用 grab_key_init() 配成下拉输入（和夹取模式一致）。
- * 帧格式见 Serial.h；解析在 Serial.c 的 K230_ParseLine（在 USART2 中断里跑）。
+ * PB1：切换模式（IDLE → CIRCLE → LINEAR → CIRCLE …）
+ * PA7：点动自检（前进→后退→左移→右移→顺时针→逆时针 轮流各一次）
+ * PA5：停止（含电机急停）
  *
- * OLED（每行 ≤16 字符，每次都先铺 16 个空格再写字，所以数字变宽不会留残影）：
- *   1 行  CIRCLE OK / LINEAR TMO / IDLE / CIRCLE WAIT
- *   2 行  圆心模式 X:318 Y:242    直线模式 K+0.04 P+1.92   没找到 NG (not found)
+ * 【两种模式都先举高】
+ *   进 CIRCLE 或 LINEAR 之前，都把升降电机（地址 6）抬到 VISION_LIFT_UP = 9000 脉冲，
+ *   方向 0x01（CCW = 升）——机械臂低了摄像头看不见圆/环。
+ *   上电时升降在最低位限位，所以 9000 = 从最低点抬起来。
+ *   按 60 RPM 约 2.8 s。已经在目标高度就跳过，不再等一遍。
+ *
+ * 【CIRCLE 模式】把圆心拉到"夹爪位置"
+ *   K230 回 C<x>,<y>,<r>，主控算 dx = x - VISION_TARGET_X、dy = y - VISION_TARGET_Y，
+ *   然后平移补偿（2026-11-17 现场实测的方向关系）：
+ *       小车前进 -> 圆心 x 变大   =>  dx>0 走**后退**，dx<0 走前进
+ *       小车右移 -> 圆心 y 变大   =>  dy>0 走**左移**，dy<0 走右移
+ *   |dx|、|dy| 都 ≤ VISION_DEADBAND_PX 就算对准，不动。
+ *   像素→毫米沿用老标定：60 px = 35 mm，再打 VISION_STEP_GAIN_PCT 折扣，
+ *   单步绝不超过 VISION_MAX_STEP_MM = 10 mm。
+ *
+ * 【为什么要慢 + 打折】位置模式是"发脉冲 → 硬起硬停"，每步一次冲击，会"抽一下"、
+ *   把 K230 晃掉线、电源抖。所以平移/旋转都走速度模式（F6）：
+ *   VISION_SPEED_X10 = 16 (1.6 RPM ≈ 6.6 mm/s，是原来 8 RPM 的 1/5)、
+ *   VISION_ACCEL_RPM_S = 120，软起软停；步长再打 VISION_STEP_GAIN_PCT = 50% 折扣。
+ *   识别不准时"补一半"比"补满"稳得多：补满必然冲过头，来回摆。
+ *   想退回位置模式把 VISION_USE_SPEED_MODE 改 0。
+ *
+ * 【LINEAR 模式】看三环 → 修车身偏航
+ *   发 "linear"，K230 回 L<k>,<psi>；psi 单位 0.01°：
+ *   3) psi 单位 0.01°：正 = 顺时针（motor_rotate_centideg dir=0x00），
+ *      负 = 逆时针（dir=0x01）。|psi| ≤ VISION_PSI_DEADBAND 就算对准。
+ *      单次最多转 VISION_PSI_MAX_STEP，防止某一帧误检把车甩飞。
+ *   4) 连着两次"越修越大"就判定符号反了 / 目标丢了：停下来报警，不再动。
+ *
+ * 【画面中心 320,240 与"夹爪偏置"】
+ *   K230 采集是 640×480，图像中心恒为 (320,240)（不是 0,0）。
+ *   但摄像头不在夹爪正上方，所以程序不把圆往 320,240 拉，而是往
+ *   **VISION_TARGET_X / VISION_TARGET_Y**（夹爪投影到画面的像素位置）拉。
+ *   这两个宏就在下面，标定方法写在它们前面的注释里 —— 要调偏置只改这两个数。
+ *   ★ 若把 K230 分辨率改成 QVGA(320×240)，中心变 (160,120)，目标点也要跟着改。
+ *
+ * OLED：
+ *   1 行  模式 + 状态（OK / WAIT / TMO）
+ *   2 行  CIRCLE: X:318 Y:242      LINEAR: K+0.04 P+1.92
  *   3 行  N:<序号> NG:<次数>
- *   4 行  PB1:CIR PA7:LIN
+ *   4 行  最后一次动作，例如 [BACK 12mm] / [CW 3.50deg] / [LIFT 10000]
  *
- * 超时：1 s 没收到对应帧 → 第 1 行变 TMO。因为不动作，超时没有危险，
- *       第 2 行保留最后一次的好数据，看 N/NG 两个计数就知道是不是在掉数据。
+ * 安全：所有电机动作都带超时（judge_wait 有轮数上限），PA5 随时急停；
+ *       举高过程（0→10000 约 7 s）内也每 10 ms 检查一次 PA5。
  * ========================================================================== */
 #define VISION_IDLE        0u
 #define VISION_CIRCLE      1u
 #define VISION_LINEAR      2u
 #define VISION_QUIET_MAX   250u     /* 每个循环约 4 ms，250 × 4 ms ≈ 1 s */
+
+/* ============================================================================
+ * ★★★ 摄像头 / 夹爪偏置：你要改的就是下面这两个数 ★★★
+ * ----------------------------------------------------------------------------
+ * 摄像头不在夹爪正上方，所以"圆心在画面正中"并不等于"夹爪在圆心正上方"。
+ * 做法很简单：把目标点从画面中心挪到"夹爪在画面里的位置"。
+ *
+ *   VISION_TARGET_X / VISION_TARGET_Y = 夹爪投影到画面上的像素坐标
+ *
+ * 【怎么标定（最省事的办法）】
+ *   1) 手推小车，让**夹爪正好对准圆心**（人眼对）；
+ *   2) 这时看 K230 那边报的圆心坐标（IDE 打印或 OLED 第 2 行的 X、Y）；
+ *   3) 把这两个数直接抄进 VISION_TARGET_X / VISION_TARGET_Y，重新烧录。
+ *   之后程序会把圆心往这个点上拉，而不是往画面正中拉。
+ *
+ * 【一定要用毫米算的话】
+ *   像素差 = 毫米 * 60 / 35（沿用"60 px = 35 mm"的老标定，但这是在某个相机
+ *   高度下标出来的，高度一变比例就变，所以还是上面那个"抄坐标"的办法最准）。
+ *   例：夹爪在摄像头右边 20 mm，标定出来约为 34 px，就把 X 改成 320 + 34。
+ *
+ * ★ 符号自己不用推：以 K230 报的坐标为准，正负它自然就对了。
+ * ========================================================================== */
+#define VISION_TARGET_X    470      /* ← 夹爪在画面里的 X（现场实测：470） */
+#define VISION_TARGET_Y    170      /* ← 夹爪在画面里的 Y（现场实测：170） */
+
+/* 画面中心（只用来显示"偏离多少"做参考，以及算默认目标点） */
+#define VISION_CX          320
+#define VISION_CY          240
+
+/* ---- CIRCLE：把圆心拉到目标点 ---- */
+/* 死区放宽到 15 px：识别本身有抖动，死区太小会一直来回修（看起来像走过头）。 */
+#define VISION_DEADBAND_PX   15     /* ±15 px 以内不动（≈9 mm） */
+#define VISION_MM_PER_60PX   35u    /* 老标定：60 px = 35 mm */
+#define VISION_MAX_STEP_MM   6u     /* ★ 单步最多 6 mm：一点点挪，但别太碎 */
+/* ★ 步长增益：只补"理论距离"的这个百分比。
+ *   识别不准 + 相机慢（3 Hz）时，一次补满必然冲过头，所以打个折：
+ *   这次补一半，剩下的下次再补 —— 收敛慢一点，但不会冲过去来回摆。
+ *   走得过冲就调小（40）；半天不到位就调大（70）。 */
+#define VISION_STEP_GAIN_PCT 50u
+/* ★ 每走一步之后停多久（ms）：
+ *   1) 等车体停稳、等 K230 拍下一帧清晰的；
+ *   2) 让电源电压恢复 —— 连续动作的电流冲击叠起来最容易把 K230 拉到重启。
+ *   这个停顿**不阻塞主循环**：照样收帧、照样刷屏，只是暂时不发新命令。 */
+#define VISION_STEP_GAP_MS   150u
+/* 梯形加减速本身要花的时间余量（估"这一步还要多久"时加上）。
+ * ★ 必须和 VISION_POS_ACCEL 一起改：加速度越小，斜坡越长。
+ *   accel=20 时 120 ms 够用；accel=8 要 400 ms 左右，否则会"上一步还在爬坡就发下一条"。 */
+#define VISION_RAMP_MS       400u
+/* 主循环一拍的周期（ms）：Delay_ms(4) + 按键扫描 + 偶尔刷屏。
+ * 用来把"这一步要多少 ms"换算成"要等多少拍"。 */
+#define VISION_LOOP_MS       4u
+
+/* 方向映射（现场实测，翻了两次才对，记在这里别再改回去）：
+ *   dx>0  ->  **前进**   （第一次按"前进让 x 变大"推成后退，实测反了；
+ *                          2026-11-17 二次实测：dx>0 要走前进）
+ *   dy>0  ->  **右移**   （同理，实测右移才对）
+ * 注意这两个宏和 motor.c 里"前进/后退"的字面含义无关：
+ *   如果哪天发现"日志说 BACK、车却往前走"，那说明 motor.c 的方向表反了
+ *   （改 MOTOR_FLIP_FWD），不是这两个宏的事。
+ *   **判断方法**：看串口那一行 `-> BACK 3mm`，对照车实际往哪走。 */
+#define VISION_DX_PLUS_DO_BACK   0  /* 0: dx>0 前进 / dx<0 后退（实测值） */
+#define VISION_DY_PLUS_DO_RIGHT  1  /* 1: dy>0 右移 / dy<0 左移（实测值） */
+/* 旋转方向：psi>0 我们约定是"顺时针"，如果实测越修越大（发散），把它改 1 翻过来。
+ * 另外还有一道保险：连续两轮 |psi| 变大就 DIVERGE STOP 停车，不会一直转。 */
+#define VISION_YAW_INVERT        0  /* 0 = psi>0 顺时针；1 = psi>0 逆时针 */
+
+/* ============================================================================
+ * 运动方式：位置模式（FD）+ 梯形加减速  ← 当前方案
+ * ----------------------------------------------------------------------------
+ * 速度模式（F6）在这台车上晃得厉害，而且它的加减速由驱动器内部管，
+ * 不好精确控制斜坡；位置模式是"发固定脉冲 + 指定速度和加速度档"，
+ * 加减速由驱动器按梯形曲线走，速度/加速度都能压到很低，动作最干净。
+ *
+ * 三个量一起压低才有效（缺一个都会抽）：
+ *   VISION_POS_SPEED_RPM  速度 8 RPM（默认 70）
+ *   VISION_POS_ACCEL      加速度档 20（默认 200，越小斜坡越缓 = 梯形越平）
+ *   VISION_MAX_STEP_MM    每次最多走 4 mm
+ * 想再慢：speed 降到 5、accel 降到 10；但太小可能带不动（听到声音不走）。
+ * ========================================================================== */
+#define VISION_USE_SPEED_MODE   0     /* 0 = 位置模式（当前）；1 = F6 速度模式 */
+#define VISION_POS_SPEED_RPM    8u    /* 位置模式速度，RPM */
+#define VISION_POS_ACCEL        8u    /* 位置模式加速度档 0~255。20 → 8：
+                                       * 斜坡更缓、起步电流更小，代价是"到位"更慢 */
+
+/* 下面三个只在 VISION_USE_SPEED_MODE = 1 时才用（F6 速度模式那套参数） */
+#define VISION_SPEED_X10        16u   /* 平移速度，0.1RPM：16 = 1.6 RPM */
+#define VISION_ROT_SPEED_X10    20u   /* 旋转速度，0.1RPM：20 = 2.0 RPM */
+#define VISION_ACCEL_RPM_S      120u  /* 加速度 RPM/s */
+
+/* ---- 举高（两个模式都用）---- */
+/* 升降电机的目标绝对位置（脉冲）。上电时升降在最低位限位，所以这就是"抬起来多少"。
+ * 9000 脉冲按 60 RPM 约 2.8 s 走完。 */
+#define VISION_LIFT_UP            9000u
+/* 每 1000 脉冲大约要等多久：60 RPM ≈ 0.32 s，取 0.35 留余量。
+ * ★ 这个值和 LIFT_MOTOR_SPEED 是绑在一起的，改那个就得改这个，否则等待和实际对不上。
+ * 等待时间按"当前位置→目标位置"的差值算，已经在高度上就不等。 */
+#define VISION_LIFT_MS_PER_1000P  550u
+#define VISION_LIFT_WAIT_MAX      6000u  /* 单次最多等 6 s */
+#define VISION_PSI_DEADBAND  60     /* 0.01°：|psi| ≤ 0.6° 算对准 */
+#define VISION_PSI_MAX_STEP  2000   /* 单次最多 20° */
+#define VISION_ALIGN_ROUNDS  8u     /* 最多调几轮 */
+#define VISION_JUDGE_ROUNDS  60u    /* judge_wait 轮数上限（一轮约 220 ms） */
+
+/* ---- K230 掉线自恢复 ----
+ * K230 被电源拉重启后，会忘掉当前模式、停止回数据，主控这边只看到 TMO。
+ * 静默超过 1 s 就自动重发一次模式命令，让它自己接上（不用人按按键）。
+ * 每 VISION_RESEND_GAP 拍重发一次，最多 VISION_RESEND_MAX 次。 */
+#define VISION_RESEND_MAX    5u
+#define VISION_RESEND_GAP    500u   /* 拍数，约 2 s */
 
 /* 整行写 16 个字符：先铺空格再写字，避免新旧数字宽度不同留下残影。
  *
@@ -3000,6 +3144,12 @@ static void pc13_uart_test(void)
  *   静态行（比如最后那行按键提示）本来就不用每帧重画，缓存后 I2C 流量能省掉九成。 */
 static char    vision_last[5][17];
 static uint8_t vision_last_valid = 0u;
+
+/* 点动标定结果：没有串口时就靠这个在屏上看"坐标变了多少" */
+static int16_t  v_dbx = 0;              /* 上一次点动后 X 的变化（像素） */
+static int16_t  v_dby = 0;              /* 上一次点动后 Y 的变化 */
+static uint8_t  v_dx_ok = 0u;           /* 1 = 这两个数是真测到的（视觉有数据） */
+static uint16_t v_calib_ticks = 0u;     /* 标定画面还要显示多少拍（0 = 不显示） */
 
 /* 清屏 / 强制整屏重画之前调用：让缓存失效，否则会以为"已经画过了"而不写 */
 static void vision_row_invalidate(void)
@@ -3042,6 +3192,353 @@ static void vision_fmt_2dp(char *out, int32_t v)
             (int)(a / 100L), (int)(a % 100L));
 }
 
+/* 把整数变成 "+96" / "-12"（Keil 的 sprintf 对 %+d 支持不稳，自己拼） */
+static void vision_fmt_signed(char *out, int32_t v)
+{
+    int32_t a = (v < 0L) ? -v : v;
+
+    sprintf(out, "%c%d", (v < 0L) ? '-' : '+', (int)a);
+}
+
+/* ---------------- 动作层：这里才开始真的动电机 ---------------- */
+
+/* 像素偏差 → 这一步实际走多少毫米。
+ *   1) 按 60px = 35mm 算理论距离
+ *   2) 乘 VISION_STEP_GAIN_PCT 打折（识别不准 + 相机 3 Hz，一次补满必然冲过头）
+ *   3) 夹到 1 ~ VISION_MAX_STEP_MM（单步绝对不会超过这个数）
+ * px=0 返回 0（不动）。
+ *
+ * 注意顺序：先打折、再夹上限。反过来的话"上限 10mm × 50%"就只剩 5mm 了，
+ * VISION_MAX_STEP_MM 这个数就失去意义。 */
+static uint32_t vision_px_to_step(int32_t px)
+{
+    uint32_t p, mm;
+
+    if(px < 0L) p = (uint32_t)(-(px + 1L)) + 1u;   /* 两补码取绝对值，INT32_MIN 也安全 */
+    else        p = (uint32_t)px;
+    if(p == 0u) return 0u;
+
+    mm = (p * VISION_MM_PER_60PX + 30u) / 60u;              /* 理论距离 */
+    mm = (mm * VISION_STEP_GAIN_PCT) / 100u;                /* 打折 */
+    if(mm < 1u) mm = 1u;
+    if(mm > VISION_MAX_STEP_MM) mm = VISION_MAX_STEP_MM;    /* 单步上限 */
+    return mm;
+}
+
+/* 急停：4 个底盘电机 + 升降电机，全发 [addr] FE 98 00 6B。
+ * 速度模式下再补一个 Chassis_Stop()（按加速度斜坡停车），双保险。 */
+static void vision_stop_all(void)
+{
+    uint8_t a;
+
+    for(a = 1u; a <= 4u; a++)
+    {
+        Serial_SendByte(a);
+        Serial_SendByte(0xFE);
+        Serial_SendByte(0x98);
+        Serial_SendByte(0x00);
+        Serial_SendByte(0x6B);
+        Delay_ms(2);
+    }
+    lift_motor_stop();
+#if VISION_USE_SPEED_MODE
+    Chassis_Stop();
+#endif
+}
+
+/* ---------------- 三个"动一下"的封装：速度模式 / 位置模式在这里切换 ---------------- */
+
+/* 前后平移：mm > 0 前进，mm < 0 后退 */
+static void vision_move_fwd(int32_t mm)
+{
+    if(mm == 0L) return;
+#if VISION_USE_SPEED_MODE
+    (void)Chassis_MoveAt(mm, (uint16_t)VISION_SPEED_X10);
+#else
+    if(mm > 0L) qianjin_((uint32_t)mm);
+    else        houtui_((uint32_t)(-mm));
+#endif
+}
+
+/* 左右平移：mm > 0 左移，mm < 0 右移（chassis.h 的约定） */
+static void vision_move_lat(int32_t mm)
+{
+    if(mm == 0L) return;
+#if VISION_USE_SPEED_MODE
+    (void)Chassis_StrafeAt(mm, (uint16_t)VISION_SPEED_X10);
+#else
+    if(mm > 0L) zuo_((uint32_t)mm);
+    else        you_((uint32_t)(-mm));
+#endif
+}
+
+/* 旋转：centi > 0 顺时针，centi < 0 逆时针（单位 0.01°）。
+ * 注意 chassis.h 的约定是"度，>0 逆时针"，和这里正好相反，所以取负。
+ * VISION_YAW_INVERT=1 时整体翻转（实测方向反了就用它，不用改别的地方）。 */
+static void vision_rotate(int32_t centi)
+{
+    if(centi == 0L) return;
+
+#if VISION_YAW_INVERT
+    centi = -centi;
+#endif
+
+#if VISION_USE_SPEED_MODE
+    {
+        int32_t deg = (centi + ((centi > 0L) ? 50L : -50L)) / 100L;   /* 四舍五入到整度 */
+        if(deg != 0L) (void)Chassis_RotateAt(-deg, (uint16_t)VISION_ROT_SPEED_X10);
+    }
+#else
+    {
+        uint8_t  dir = (centi > 0L) ? 0x00u : 0x01u;
+        uint32_t p   = (uint32_t)((centi > 0L) ? centi : -centi);
+        (void)motor_rotate_centideg(dir, (int32_t)p);
+    }
+#endif
+}
+
+/* 一步大概要多久（ms）：脉冲数 ÷ 每秒脉冲 + 梯形斜坡余量 + 停顿。
+ * 用来把"这一步要多少 ms"换算成主循环要等多少拍（见 VISION_LOOP_MS）。
+ * 只是个估算，但足够避免"前一步还没走完就叠下一条命令"。 */
+static uint16_t vision_step_ms(int32_t mm)
+{
+    uint32_t p = (uint32_t)((mm < 0L) ? -mm : mm);
+    uint32_t pulses, pps, ms;
+
+    if(p == 0u) return 0u;
+
+    pulses = p * MOTOR_PULSE_PER_100CM / 1000u;                    /* 约 13 脉冲/mm */
+    pps    = (uint32_t)VISION_POS_SPEED_RPM
+             * (uint32_t)CHASSIS_PULSES_PER_REV / 60u;             /* 8 RPM -> 426 脉冲/s */
+    if(pps == 0u) pps = 1u;
+
+    ms  = pulses * 1000u / pps;                                    /* 匀速段 */
+    ms += VISION_RAMP_MS;                                          /* 梯形加减速 */
+    ms += VISION_STEP_GAP_MS;                                      /* 停顿 */
+    if(ms < 120u) ms = 120u;
+    return (uint16_t)ms;
+}
+
+/* CIRCLE 一步：**不阻塞**。发完命令立刻返回，主循环接着收帧/刷屏。
+ *
+ * 返回 = 这一步大概需要多少 ms（0 = 已在死区，没动）。
+ * 调用方用它决定"多少拍之内不发新命令"，而不是傻等。
+ *
+ * 一次只动一个轴（电流最小、最不抽），优先修偏差大的那个。
+ * 这样两个轴会交替收敛，比"永远先修 x 再修 y"快。 */
+static uint16_t vision_circle_issue(int32_t cx, int32_t cy, char *act)
+{
+    int32_t  dx = cx - (int32_t)VISION_TARGET_X;
+    int32_t  dy = cy - (int32_t)VISION_TARGET_Y;
+    int32_t  adx = (dx < 0L) ? -dx : dx;
+    int32_t  ady = (dy < 0L) ? -dy : dy;
+    uint8_t  dx_bad = ((dx > VISION_DEADBAND_PX) || (dx < -VISION_DEADBAND_PX)) ? 1u : 0u;
+    uint8_t  dy_bad = ((dy > VISION_DEADBAND_PX) || (dy < -VISION_DEADBAND_PX)) ? 1u : 0u;
+    uint32_t mm;
+
+    if(!dx_bad && !dy_bad)
+    {
+        sprintf(act, "ALIGNED");
+        return 0u;
+    }
+
+    /* 两个轴都超死区时，先修大的那个 */
+    if(dx_bad && (!dy_bad || (adx >= ady)))
+    {
+        mm = vision_px_to_step(dx);
+        if(dx > 0L)
+        {
+#if VISION_DX_PLUS_DO_BACK
+            vision_move_fwd(-(int32_t)mm);
+            sprintf(act, "BACK %umm", (unsigned)mm);
+#else
+            vision_move_fwd((int32_t)mm);
+            sprintf(act, "AHEAD %umm", (unsigned)mm);
+#endif
+        }
+        else
+        {
+#if VISION_DX_PLUS_DO_BACK
+            vision_move_fwd((int32_t)mm);
+            sprintf(act, "AHEAD %umm", (unsigned)mm);
+#else
+            vision_move_fwd(-(int32_t)mm);
+            sprintf(act, "BACK %umm", (unsigned)mm);
+#endif
+        }
+        return vision_step_ms((int32_t)mm);
+    }
+
+    mm = vision_px_to_step(dy);
+    if(dy > 0L)
+    {
+#if VISION_DY_PLUS_DO_RIGHT
+        vision_move_lat(-(int32_t)mm);                /* dy>0 -> 右移 */
+        sprintf(act, "RIGHT %umm", (unsigned)mm);
+#else
+        vision_move_lat((int32_t)mm);                 /* dy>0 -> 左移 */
+        sprintf(act, "LEFT %umm", (unsigned)mm);
+#endif
+    }
+    else
+    {
+#if VISION_DY_PLUS_DO_RIGHT
+        vision_move_lat((int32_t)mm);                 /* dy<0 -> 左移 */
+        sprintf(act, "LEFT %umm", (unsigned)mm);
+#else
+        vision_move_lat(-(int32_t)mm);                /* dy<0 -> 右移 */
+        sprintf(act, "RIGHT %umm", (unsigned)mm);
+#endif
+    }
+    return vision_step_ms((int32_t)mm);
+}
+
+
+/* 旋转一步大概要多久（ms）：脉冲数 ÷ 每秒脉冲 + 梯形斜坡 + 停顿。
+ * 脉冲/度 = MOTOR_PULSE_PER_360DEG / 360 = 17208/360 ≈ 47.8。
+ * 注意 p_centi 是 0.01°，所以除 36000。 */
+static uint16_t vision_rot_ms(uint32_t p_centi)
+{
+    uint32_t pulses, pps, ms;
+
+    if(p_centi == 0u) return 0u;
+
+    pulses = p_centi * (uint32_t)MOTOR_PULSE_PER_360DEG / 36000u;
+    pps    = (uint32_t)VISION_POS_SPEED_RPM
+             * (uint32_t)CHASSIS_PULSES_PER_REV / 60u;
+    if(pps == 0u) pps = 1u;
+
+    ms  = pulses * 1000u / pps;
+    ms += VISION_RAMP_MS;
+    ms += VISION_STEP_GAP_MS;
+    if(ms < 120u) ms = 120u;
+    return (uint16_t)ms;
+}
+
+/* LINEAR 一步：**不阻塞**，返回这一步大概要多久（0 = 已在死区）。
+ *
+ * ★ 这里不再等 0x3A 回包。原因：0x3A 只说明"驱动器回没回应"，和
+ *   "命令有没有发出去"是两回事 —— 用它当失败条件就会出现
+ *   "电机明明在动，OLED 却一直显示 MOTOR TIMEOUT"。
+ *   想确认驱动器在不在，用 PA7 点动（那条专门查 0x3A）。 */
+static uint16_t vision_yaw_issue(int16_t psi_centi, char *act)
+{
+    int32_t  v = (int32_t)psi_centi;
+    uint8_t  dir;
+    uint32_t p;
+
+    if((v <= (int32_t)VISION_PSI_DEADBAND) &&
+       (v >= -(int32_t)VISION_PSI_DEADBAND))
+    {
+        sprintf(act, "YAW OK");
+        return 0u;
+    }
+
+    if(v >  (int32_t)VISION_PSI_MAX_STEP) v =  (int32_t)VISION_PSI_MAX_STEP;
+    if(v < -(int32_t)VISION_PSI_MAX_STEP) v = -(int32_t)VISION_PSI_MAX_STEP;
+
+    /* 旋转也一样打折：别一次转到满，慢慢靠过去，不然画面晃得识别更不准 */
+    v = (v * (int32_t)VISION_STEP_GAIN_PCT) / 100L;
+    if(v == 0L){ sprintf(act, "YAW OK"); return 0u; }
+
+    if(v > 0L){ dir = 0x00u; p = (uint32_t)v; }        /* 正 = 顺时针 */
+    else      { dir = 0x01u; p = (uint32_t)(-v); }     /* 负 = 逆时针 */
+
+#if VISION_YAW_INVERT
+    dir ^= 0x01u;                                      /* 实测方向反了就翻过来 */
+#endif
+
+    sprintf(act, "%s %u.%02udeg", (dir == 0x00u) ? "CW" : "CCW",
+            (unsigned)(p / 100u), (unsigned)(p % 100u));
+
+    vision_rotate((v > 0L) ? (int32_t)p : -(int32_t)p);   /* 正数=CW */
+
+    return vision_rot_ms(p);
+}
+
+/* PA7 点动自检：每按一次做一种动作，轮流覆盖 前进/后退/左移/右移/顺时针/逆时针。
+ * 用途：接视觉之前先确认"车到底动不动、每个方向对不对"。
+ * 幅度都很小（50 mm / 15°），但轮子悬空时看不出方向，所以最好架空或垫起来试。
+ * 返回 1 正常 / 0 电机没回报到位。 */
+#define VISION_JOG_MM    50u
+#define VISION_JOG_DEG   15u
+#define VISION_JOG_COUNT 6u
+
+static uint8_t vision_jog(uint8_t idx, char *act)
+{
+    switch(idx % VISION_JOG_COUNT)
+    {
+        case 0u: qianjin_(VISION_JOG_MM);  sprintf(act, "JOG AHEAD");  break;
+        case 1u: houtui_(VISION_JOG_MM);   sprintf(act, "JOG BACK");   break;
+        case 2u: zuo_(VISION_JOG_MM);      sprintf(act, "JOG LEFT");   break;
+        case 3u: you_(VISION_JOG_MM);      sprintf(act, "JOG RIGHT");  break;
+        case 4u: shun_yaw_(VISION_JOG_DEG);sprintf(act, "JOG CW");     break;
+        default: ni_yaw_(VISION_JOG_DEG);  sprintf(act, "JOG CCW");    break;
+    }
+
+    USART3_Printf("[VISION] %s（%s %u）\r\n", act,
+                  ((idx % VISION_JOG_COUNT) < 4u) ? "mm" : "deg",
+                  (unsigned)(((idx % VISION_JOG_COUNT) < 4u) ? VISION_JOG_MM
+                                                             : VISION_JOG_DEG));
+
+    return judge_wait(VISION_JUDGE_ROUNDS) ? 1u : 0u;
+}
+
+/* 举高机械臂到 target 脉冲（绝对位置），方向 0x01 = CCW = 升。
+ * ★ 已经在目标高度就**直接返回**，不重发也不白等 —— CIRCLE ⇄ LINEAR 来回切
+ *   的时候很常见（两个模式都要举到同一个高度）。
+ * 等待时间按"当前位置 → 目标位置"的差值估算，每 10 ms 查一次 PA5，随时能中止。
+ * 返回 1 = 到位（或本来就在），0 = 被 PA5 中止。 */
+static uint8_t vision_lift_to(uint32_t target, char *act)
+{
+    uint16_t t, total;
+    uint32_t from, diff, ms;
+
+    sprintf(act, "LIFT %u", (unsigned)target);
+
+    if(g_lift_target == target)
+    {
+        USART3_Printf("[VISION] lift already at %u，跳过\r\n", (unsigned)target);
+        return 1u;
+    }
+
+    from = g_lift_target;                    /* 发命令前先记下旧值 */
+
+    motor_enable_addr(LIFT_MOTOR_ADDR);      /* 地址 6 上电默认失能 */
+    Delay_ms(20);
+
+    lift_motor_move(target, 0x01u);          /* 绝对位置 + CCW 升 */
+
+    diff = (target > from) ? (target - from) : (from - target);
+    ms   = (diff * VISION_LIFT_MS_PER_1000P) / 1000u;
+    if(ms < 500u) ms = 500u;
+    if(ms > VISION_LIFT_WAIT_MAX) ms = VISION_LIFT_WAIT_MAX;
+    total = (uint16_t)(ms / 10u);
+
+    USART3_Printf("[VISION] lift %u -> %u（%u 脉冲，约 %u ms）\r\n",
+                  (unsigned)from, (unsigned)target, (unsigned)diff, (unsigned)ms);
+
+    for(t = 0u; t < total; t++)
+    {
+        if(grab_abort_hit())
+        {
+            lift_motor_stop();
+            return 0u;
+        }
+
+        /* 超过 1 秒才报进度，别让人以为卡住了 */
+        if((total > 100u) && ((t % 100u) == 0u))
+        {
+            USART3_Printf("[VISION] lifting %u%%\r\n",
+                          (unsigned)(((uint32_t)t * 100u) / (uint32_t)total));
+        }
+
+        Delay_ms(10);
+    }
+    USART3_Printf("[VISION] lift done\r\n");
+    return 1u;
+}
+
 static void vision_link_test(void)
 {
     uint8_t  mode    = VISION_IDLE;
@@ -3050,10 +3547,32 @@ static void vision_link_test(void)
     uint32_t cseq = 0u, lseq = 0u, ngseq = 0u;
     uint16_t quiet = 0u;
     uint16_t tick  = 0u;
+    uint8_t  rounds = 0u;               /* LINEAR 已经调了几轮 */
+    uint8_t  jog_idx = 0u;              /* PA7 点动自检轮到哪个动作 */
+    uint16_t v_wait = 0u;               /* CIRCLE：还要等多少拍才能发下一步（非阻塞） */
+    uint16_t v_n = 0u;                  /* CIRCLE：已经走了多少步（统计频率用） */
+    uint16_t v_tick = 0u;               /* CIRCLE：上一步是在哪个 tick 发的 */
+    uint32_t v_interval_sum = 0u;       /* CIRCLE：累计间隔（tick 数），算平均用 */
+    uint8_t  v_retry = 0u;              /* K230 静默后重发模式命令的次数 */
+    uint16_t v_resend_wait = 0u;        /* 距离下次重发还有多少拍 */
+    int32_t  last_abs_psi = -1L;        /* 上一轮的 |psi|，用来判"越修越大" */
     char     row[24];
     char     kbuf[12], pbuf[12];
+    char     sbx[8], sby[8];
+    char     dbx[8], dby[8];
+    char     act[17];                   /* 第 4 行显示的动作 */
 
     grab_key_init();                     /* PB1 / PA7 / PA5：下拉输入，按下为高 */
+
+#if VISION_USE_SPEED_MODE
+    /* 速度模式底盘：使能四轮 + 设一个柔和的加速度 */
+    Chassis_Init();
+    Chassis_SetAccel((uint16_t)VISION_ACCEL_RPM_S);
+#else
+    /* 位置模式：把速度和加速度档都压到很低 —— 驱动器按梯形曲线软起软停。
+     * 这一步很关键：光降速度不降加速度，起步/停车那一下仍然是冲击。 */
+    motor_set_profile((uint16_t)VISION_POS_SPEED_RPM, (uint16_t)VISION_POS_ACCEL);
+#endif
 
     /* ---------- 开机先画一屏静态内容，专门用来验屏 ----------
      * 如果这一屏也"只有上半截"，那就是驱动/接线的事，跟视觉数据无关；
@@ -3063,62 +3582,272 @@ static void vision_link_test(void)
     vision_row(1u, "OLED SELF TEST");
     vision_row(2u, "ABCDEFGHIJKLMNOP");
     vision_row(3u, "1234567890+-,.:;");
-    vision_row(4u, "VISION v1");
+    vision_row(4u, "VISION v2");
     Delay_ms(1200);
+
+    sprintf(act, "READY");
 
     OLED_Clear();
     vision_row_invalidate();
     vision_row(1u, "VISION IDLE");
-    vision_row(2u, "PB1:CIRCLE");
-    vision_row(3u, "PA7:LINEAR");
-    vision_row(4u, "PA5:STOP");
+    vision_row(2u, "PB1 MODE PA7 JOG");
+    vision_row(3u, "PA5 STOP");
+    vision_row(4u, "[READY]");
 
-    USART3_SendString("\r\n[VISION] PB1=circle PA7=linear PA5=stop\r\n");
+    USART3_SendString("\r\n[VISION v3] PB1=mode  PA7=jog  PA5=stop\r\n");
+    USART3_Printf("[VISION] 目标点(夹爪) = (%d,%d)，画面中心 = (%d,%d)\r\n",
+                  VISION_TARGET_X, VISION_TARGET_Y, VISION_CX, VISION_CY);
+    USART3_Printf("[VISION] 两种模式都会先举高到 %u 脉冲（约 %u ms）\r\n",
+                  (unsigned)VISION_LIFT_UP,
+                  (unsigned)((VISION_LIFT_UP * VISION_LIFT_MS_PER_1000P) / 1000u));
+#if VISION_USE_SPEED_MODE
+    USART3_Printf("[VISION] 速度模式：平移 %u.%uRPM 旋转 %u.%uRPM 加速度 %u RPM/s\r\n",
+                  (unsigned)(VISION_SPEED_X10 / 10u), (unsigned)(VISION_SPEED_X10 % 10u),
+                  (unsigned)(VISION_ROT_SPEED_X10 / 10u), (unsigned)(VISION_ROT_SPEED_X10 % 10u),
+                  (unsigned)VISION_ACCEL_RPM_S);
+#else
+    USART3_Printf("[VISION] 位置模式：速度 %u RPM，加速度档 %u（梯形软起软停）\r\n",
+                  (unsigned)motor_get_speed(), (unsigned)motor_get_accel());
+#endif
+    USART3_Printf("[VISION] 步长：增益 %u%%，单步上限 %u mm，步间停 %u ms，死区 ±%d px\r\n",
+                  (unsigned)VISION_STEP_GAIN_PCT, (unsigned)VISION_MAX_STEP_MM,
+                  (unsigned)VISION_STEP_GAP_MS, VISION_DEADBAND_PX);
+    USART3_Printf("[VISION] K230 静默会每 %u ms 自动重发模式命令，最多 %u 次\r\n",
+                  (unsigned)(VISION_RESEND_GAP * VISION_LOOP_MS),
+                  (unsigned)VISION_RESEND_MAX);
+    USART3_Printf("[VISION] dx>0 -> %s，dy>0 -> %s\r\n",
+                  VISION_DX_PLUS_DO_BACK ? "后退" : "前进",
+                  VISION_DY_PLUS_DO_RIGHT ? "右移" : "左移");
+#if VISION_YAW_INVERT
+    USART3_SendString("[VISION] 旋转方向已翻转（VISION_YAW_INVERT=1）\r\n");
+#endif
 
     while(1)
     {
         uint8_t changed = 0u;
 
-        /* ---------- 按键：发命令 + 切模式 ---------- */
-        if(grab_step_hit())                                  /* PB1 */
+        /* ---------- PB1：切换模式（IDLE → CIRCLE → LINEAR → CIRCLE …） ----------
+         * 两个模式进来都先把机械臂举到 VISION_LIFT_UP：机械臂低了摄像头看不见圆。 */
+        if(grab_step_hit())
         {
-            K230_SendLine(K230_CMD_CIRCLE);
-            mode = VISION_CIRCLE;
-            cseq = K230_CircleSeq;
-            got_any = 0u; last_ng = 0u; quiet = 0u; changed = 1u;
-            USART3_SendString("[VISION] TX circle\r\n");
+            uint8_t next = (mode == VISION_CIRCLE) ? VISION_LINEAR : VISION_CIRCLE;
+
+            mode = next;
+            got_any = 0u; last_ng = 0u; quiet = 0u;
+            rounds = 0u; last_abs_psi = -1L;
+            v_wait = 0u; v_n = 0u; v_interval_sum = 0u;      /* 循环统计重新开始 */
+            changed = 1u;
+
+            vision_row(1u, (next == VISION_CIRCLE) ? "CIRCLE LIFTING" : "LINEAR LIFTING");
+            vision_row(4u, "[LIFTING]");
+
+            if(!vision_lift_to(VISION_LIFT_UP, act))
+            {
+                mode = VISION_IDLE;
+                sprintf(act, "LIFT ABORT");
+                USART3_SendString("[VISION] lift aborted by PA5\r\n");
+            }
+            else if(next == VISION_CIRCLE)
+            {
+                cseq = K230_CircleSeq;
+                K230_SendLine(K230_CMD_CIRCLE);
+                sprintf(act, "CIRCLE");
+                USART3_SendString("[VISION] TX circle\r\n");
+            }
+            else
+            {
+                lseq = K230_LineSeq;
+                K230_SendLine(K230_CMD_LINEAR);
+                USART3_SendString("[VISION] TX linear\r\n");
+            }
+            changed = 1u;
         }
-        else if(grab_start_hit())                            /* PA7 */
+        else if(grab_abort_hit())                            /* PA5：全部停下 */
         {
-            K230_SendLine(K230_CMD_LINEAR);
-            mode = VISION_LINEAR;
-            lseq = K230_LineSeq;
-            got_any = 0u; last_ng = 0u; quiet = 0u; changed = 1u;
-            USART3_SendString("[VISION] TX linear\r\n");
-        }
-        else if(grab_abort_hit())                            /* PA5 */
-        {
+            vision_stop_all();
             K230_SendLine(K230_CMD_STOP);
             mode = VISION_IDLE;
-            got_any = 0u; last_ng = 0u; quiet = 0u; changed = 1u;
-            USART3_SendString("[VISION] TX stop\r\n");
+            got_any = 0u; last_ng = 0u; quiet = 0u; rounds = 0u;
+            v_wait = 0u; v_n = 0u; v_interval_sum = 0u;
+            v_calib_ticks = 0u;                  /* PA5 也用来清掉标定画面 */
+            sprintf(act, "STOPPED");
+            changed = 1u;
+            USART3_SendString("[VISION] STOP (motors stopped)\r\n");
+        }
+        else if(grab_start_hit())                            /* PA7：点动自检 */
+        {
+            /* 前后左右 + 两个旋转轮流来一遍，用来确认"车到底动不动、方向对不对"。
+             * 和视觉无关，所以任何时候按都有效。
+             * 如果视觉正在出数据（CIRCLE 模式），顺手量一下"这个动作让圆心坐标变了多少"
+             * —— 这就是标定方向宏的第一手数据，不用再猜。 */
+            int32_t  x0 = (int32_t)K230_Cx;
+            int32_t  y0 = (int32_t)K230_Cy;
+            uint32_t s0 = K230_CircleSeq;
+            uint16_t w;
+
+            v_dx_ok = 0u;                       /* 先假设测不到，下面真测到再置 1 */
+
+            if(!vision_jog(jog_idx, act))
+            {
+                sprintf(act, "JOG NO REPLY");
+                USART3_Printf("[VISION] PA7 点动：命令发出去了但没收到 0x3A 回包。\r\n");
+                USART3_Printf("         这不等于电机没动 —— 先看轮子转了没有：\r\n");
+                USART3_Printf("           转了   -> 只是 PA10(RX) 没接/接错，回包收不到，控制照常能用\r\n");
+                USART3_Printf("           没转   -> 查 24V、PA9(TX) 到驱动器 RX、共地、驱动器地址、F3 使能\r\n");
+                vision_stop_all();
+            }
+            jog_idx++;
+            changed = 1u;
+
+            if((mode == VISION_CIRCLE) && (s0 != 0u))
+            {
+                for(w = 0u; w < 200u; w++)          /* 最多等 1 s 等新一帧 */
+                {
+                    if(K230_CircleSeq != s0) break;
+                    if(grab_abort_hit()) break;
+                    Delay_ms(5);
+                }
+                if(K230_CircleSeq != s0)
+                {
+                    v_dbx = (int16_t)((int32_t)K230_Cx - x0);
+                    v_dby = (int16_t)((int32_t)K230_Cy - y0);
+                    v_dx_ok = 1u;
+                    vision_fmt_signed(dbx, (int32_t)v_dbx);
+                    vision_fmt_signed(dby, (int32_t)v_dby);
+                    USART3_Printf("[VISION] 方向标定：%s 之后 dx%s dy%s\r\n",
+                                  act, dbx, dby);
+                }
+            }
+
+            /* 没有串口也能看到：把标定画面顶到屏上 8 秒左右（1000 拍 × 4ms ≈ 4 s） */
+            v_calib_ticks = 1000u;
+            changed = 1u;
         }
 
-        /* ---------- 来了新帧？（看序号变没变，天然不怕旧帧） ---------- */
-        if((mode == VISION_CIRCLE) && (K230_CircleSeq != cseq))
+        /* ---------- CIRCLE：非阻塞的循环控制 ----------
+         * 每来一帧新坐标就想动一步；"上一步还在走"时先等 —— 用计数等，
+         * 不用 Delay，所以等的时候照常收帧、照常刷屏、照常响应按键。 */
+        if(mode == VISION_CIRCLE)
         {
-            cseq = K230_CircleSeq; got_any = 1u; last_ng = 0u; quiet = 0u; changed = 1u;
+            if(v_wait > 0u) v_wait--;
+
+            if((K230_CircleSeq != cseq) && (v_wait == 0u))
+            {
+                uint16_t need;
+
+                cseq = K230_CircleSeq;
+                got_any = 1u; last_ng = 0u; quiet = 0u;
+
+                need = vision_circle_issue((int32_t)K230_Cx, (int32_t)K230_Cy, act);
+                v_wait = (uint16_t)((need + VISION_LOOP_MS - 1u) / VISION_LOOP_MS);
+
+                if(need != 0u)
+                {
+                    /* 统计闭环频率：最近 20 步的平均间隔（tick 是 uint16_t，要按模算差值） */
+                    if(v_n != 0u)
+                    {
+                        v_interval_sum += (uint32_t)((uint16_t)(tick - v_tick));
+                    }
+                    v_tick = tick;
+                    v_n++;
+
+                    if((v_n % 20u) == 0u)
+                    {
+                        uint32_t gap_ms = v_interval_sum * VISION_LOOP_MS / (uint32_t)(v_n - 1u);
+                        if(gap_ms == 0u) gap_ms = 1u;
+                        USART3_Printf("[VISION] 已走 %u 步，平均 %u ms/步（约 %u 步/秒）\r\n",
+                                      (unsigned)v_n, (unsigned)gap_ms,
+                                      (unsigned)(1000u / gap_ms));
+                    }
+                }
+
+                USART3_Printf("[VISION] circle (%d,%d) -> %s (%u ms)\r\n",
+                              (int)K230_Cx, (int)K230_Cy, act, (unsigned)need);
+            }
         }
-        if((mode == VISION_LINEAR) && (K230_LineSeq != lseq))
+
+        /* ---------- LINEAR：非阻塞，来了新偏航就修一步 ---------- */
+        if(mode == VISION_LINEAR)
         {
-            lseq = K230_LineSeq; got_any = 1u; last_ng = 0u; quiet = 0u; changed = 1u;
+            if(v_wait > 0u) v_wait--;
+
+            if((K230_LineSeq != lseq) && (v_wait == 0u))
+            {
+                int16_t  psi = K230_PsiCenti;
+                int32_t  ap  = (psi < 0) ? (int32_t)(-psi) : (int32_t)psi;
+                uint16_t need;
+
+                lseq = K230_LineSeq;
+                got_any = 1u; last_ng = 0u; quiet = 0u; changed = 1u;
+
+                if((rounds > 0u) &&
+                   (last_abs_psi >= (int32_t)VISION_PSI_DEADBAND) &&
+                   (ap > last_abs_psi))
+                {
+                    /* 越修越大：方向反了，或者目标换了 -> 立刻停，别再动 */
+                    sprintf(act, "DIVERGE STOP");
+                    USART3_Printf("[VISION] psi %d -> %d 变大了，判定方向反了，停止\r\n",
+                                  (int)last_abs_psi, (int)ap);
+                    vision_stop_all();
+                    mode = VISION_IDLE;
+                }
+                else if(rounds >= VISION_ALIGN_ROUNDS)
+                {
+                    sprintf(act, "ROUNDS OUT");
+                    USART3_Printf("[VISION] 调了 %u 轮还没到 0.6°，停下\r\n",
+                                  (unsigned)rounds);
+                    mode = VISION_IDLE;
+                }
+                else
+                {
+                    need = vision_yaw_issue(psi, act);          /* 不等回包，只看时间 */
+                    v_wait = (uint16_t)((need + VISION_LOOP_MS - 1u) / VISION_LOOP_MS);
+                    rounds++;
+                    last_abs_psi = ap;
+                }
+
+                USART3_Printf("[VISION] psi=%d -> %s (%u ms, round %u)\r\n",
+                              (int)psi, act, (unsigned)need, (unsigned)rounds);
+            }
         }
+
+        /* NG：只记数，绝不动作 */
         if(K230_NgSeq != ngseq)
         {
             ngseq = K230_NgSeq; got_any = 1u; last_ng = 1u; quiet = 0u; changed = 1u;
         }
 
         if(quiet < VISION_QUIET_MAX) quiet++;
+        if(quiet <= 1u) v_retry = 0u;        /* 刚收到新帧：重试计数清零 */
+
+        /* ---------- K230 掉线自己接回来 ----------
+         * K230 被电源拉重启后会忘掉当前模式、不再回数据，主控只看到 TMO。
+         * 这里静默超过 1 s 就重发一次模式命令；最多连发 VISION_RESEND_MAX 次。 */
+        if((mode != VISION_IDLE) && (quiet >= VISION_QUIET_MAX))
+        {
+            if(v_resend_wait > 0u)
+            {
+                v_resend_wait--;
+            }
+            else
+            {
+                if(v_retry < VISION_RESEND_MAX)
+                {
+                    K230_SendLine((mode == VISION_CIRCLE) ? K230_CMD_CIRCLE
+                                                          : K230_CMD_LINEAR);
+                    v_retry++;
+                    changed = 1u;
+                    USART3_Printf("[VISION] 静默 %ums，重发模式命令（第 %u 次）\r\n",
+                                  (unsigned)quiet * VISION_LOOP_MS,
+                                  (unsigned)v_retry);
+                }
+                v_resend_wait = VISION_RESEND_GAP;
+            }
+        }
+        else
+        {
+            v_resend_wait = 0u;
+        }
 
         /* 每约 2 秒：强制整屏重刷一次（防止偶发丢事务留下半个字），
          * 同时把 OLED 的 I2C 失败次数打到调试串口 —— 这个数是排查的关键：
@@ -3130,55 +3859,104 @@ static void vision_link_test(void)
             USART3_Printf("[oled] i2c_err=%u\r\n", (unsigned)OLED_GetI2cErrors());
         }
 
-        /* ---------- 每 500 ms（或状态刚变化）刷一次屏，内容没变的行不会真写 ---------- */
-        if(changed || ((tick % 125u) == 0u))
+        /* ---------- 刷屏：约每 300 ms 一次，按键/切模式立刻刷 ----------
+         * ★ 不能每来一帧就刷：OLED 是 100 kHz 的 I2C，刷 3 行大约要 70 ms，
+         *   比一步动作还长。以前每次收到坐标就整屏重画，把闭环频率直接砍半。 */
+        if(changed || ((tick % 75u) == 0u))
         {
             const char *label;
             const char *state;
 
+            /* ---------- 优先显示"点动标定"画面 ----------
+             * 没有串口的时候，这就是唯一能看到"发了什么命令 + 坐标变了多少"的地方。
+             * 你只需要看两件事：上面写的命令是什么、车实际往哪走了。 */
+            if(v_calib_ticks > 0u)
+            {
+                v_calib_ticks--;
+
+                vision_row(1u, act);                       /* 例如 JOG AHEAD */
+
+                if(v_dx_ok)
+                {
+                    vision_fmt_signed(sbx, v_dbx);
+                    vision_fmt_signed(sby, v_dby);
+                    sprintf(row, "dx%s dy%s", sbx, sby);
+                    vision_row(2u, row);
+                }
+                else
+                {
+                    vision_row(2u, "dx? dy? no vis");
+                }
+
+                vision_row(3u, "car went where?");
+                vision_row(4u, "PA5 to clear");
+                goto draw_done;
+            }
+
             if(mode == VISION_CIRCLE)      label = "CIRCLE";
             else if(mode == VISION_LINEAR) label = "LINEAR";
-            else                           label = "IDLE";
+            else                           label = "VISION";   /* -> "VISION IDLE" */
 
-            if(mode == VISION_IDLE)              state = "";
-            else if(!got_any)                    state = " WAIT";
-            else if(quiet >= VISION_QUIET_MAX)   state = " TMO";
-            else                                 state = " OK";
+            if(mode == VISION_IDLE)              state = "IDLE";
+            else if(!got_any)                    state = "WAIT";
+            else if(quiet >= VISION_QUIET_MAX)   state = "TMO";
+            else                                 state = "RUN";
 
-            sprintf(row, "%s%s", label, state);
+            sprintf(row, "%s %s", label, state);
             vision_row(1u, row);
 
             if(mode == VISION_CIRCLE)
             {
-                if(last_ng) vision_row(2u, "NG (not found)");
+                if(last_ng) vision_row(2u, "NG: no circle");
                 else
                 {
-                    sprintf(row, "X:%d Y:%d", (int)K230_Cx, (int)K230_Cy);
+                    sprintf(row, "X%d Y%d R%d", (int)K230_Cx, (int)K230_Cy,
+                            (int)K230_R);
                     vision_row(2u, row);
                 }
-                sprintf(row, "R:%d N:%u", (int)K230_R, (unsigned)K230_CircleSeq);
+
+                /* 第 3 行：相对**目标点**（夹爪位置）的偏差，这才是程序真正用来动的量 */
+                vision_fmt_signed(sbx, (int32_t)K230_Cx - (int32_t)VISION_TARGET_X);
+                vision_fmt_signed(sby, (int32_t)K230_Cy - (int32_t)VISION_TARGET_Y);
+                sprintf(row, "dX%s dY%s", sbx, sby);
                 vision_row(3u, row);
             }
             else if(mode == VISION_LINEAR)
             {
-                if(last_ng) vision_row(2u, "NG (not found)");
+                if(last_ng) vision_row(2u, "NG: no line");
                 else
                 {
-                    vision_fmt_2dp(kbuf, (int32_t)K230_K100);
                     vision_fmt_2dp(pbuf, (int32_t)K230_PsiCenti);
-                    sprintf(row, "K%s P%s", kbuf, pbuf);
+                    sprintf(row, "psi%sdeg", pbuf);
                     vision_row(2u, row);
                 }
-                sprintf(row, "N:%u NG:%u", (unsigned)K230_LineSeq, (unsigned)K230_NgSeq);
+
+                vision_fmt_2dp(kbuf, (int32_t)K230_K100);
+                sprintf(row, "k%s NG%u", kbuf, (unsigned)K230_NgSeq);
                 vision_row(3u, row);
             }
             else
             {
-                vision_row(2u, "PB1:CIRCLE");
-                vision_row(3u, "PA7:LINEAR");
+                vision_row(2u, "PB1 SW MODE");
+                vision_row(3u, "PA7 JOG PA5 STP");
             }
 
-            vision_row(4u, "PB1:CIR PA7:LIN");
+            /* 第 4 行：待机时显示当前方向映射（没串口也能确认），其余显示最后的动作 */
+            if(mode == VISION_IDLE)
+            {
+                sprintf(row, "%s %s",
+                        VISION_DX_PLUS_DO_BACK ? "DX+BACK" : "DX+FWD",
+                        VISION_DY_PLUS_DO_RIGHT ? "DY+RGT" : "DY+LFT");
+                vision_row(4u, row);
+            }
+            else
+            {
+                sprintf(row, "[%s]", act);
+                vision_row(4u, row);
+            }
+
+draw_done:
+            ;
         }
 
         tick++;

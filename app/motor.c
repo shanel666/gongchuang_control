@@ -42,6 +42,36 @@ static uint8_t motor_dir_bit(uint8_t addr, uint8_t dir)
     return (uint8_t)(dir ^ (inv ? 0x01u : 0x00u));
 }
 
+/* ★ 运行时速度 / 加速度（梯形加减速的两个关键量）
+ * ----------------------------------------------------------------------------
+ * 原来是写死的宏 MOTOR_SPEED / MOTOR_ACCEL。vision 模式需要"很慢很慢"，
+ * 光降低速度不够，加速度（梯形斜坡）也必须小，否则起步/停车那一下仍然是冲击，
+ * 会把 K230 晃到掉电重启。
+ *
+ *   speed_rpm  速度，单位 RPM，0 = 恢复默认 MOTOR_SPEED
+ *   accel      加速度档 0~255，越小斜坡越缓（梯形越"平"），0 = 恢复默认
+ *
+ * 只影响 FD 位置模式这七个动作（前后左右 + 两个旋转 + motor_rotate_centideg），
+ * 不影响 motor_jog_addr 和 F6 速度模式。
+ * -------------------------------------------------------------------------- */
+static uint16_t g_motor_speed = MOTOR_SPEED;
+static uint16_t g_motor_accel = MOTOR_ACCEL;
+
+void motor_set_profile(uint16_t speed_rpm, uint16_t accel)
+{
+    g_motor_speed = (speed_rpm == 0u) ? (uint16_t)MOTOR_SPEED : speed_rpm;
+    g_motor_accel = (accel == 0u)     ? (uint16_t)MOTOR_ACCEL : accel;
+}
+
+uint16_t motor_get_speed(void) { return g_motor_speed; }
+uint16_t motor_get_accel(void) { return g_motor_accel; }
+
+/* 三个宏替代原来的 MOTOR_SPEED_H / MOTOR_SPEED_L / MOTOR_ACCEL，
+ * 这样下面七个动作的帧不用逐个改，改一处就全生效。 */
+#define MOTOR_SPD_H()   ((uint8_t)(g_motor_speed >> 8))
+#define MOTOR_SPD_L()   ((uint8_t)(g_motor_speed & 0xFFu))
+#define MOTOR_ACC()     ((uint8_t)((g_motor_accel > 255u) ? 255u : g_motor_accel))
+
 /* 给一个地址发一帧：地址 + 逻辑方向 → 实际方向位 → 发送。
  * 把"地址"和"方向"写在一起，改 MOTOR_ADDR_* 时不会漏改另一处。 */
 #define SEND_WHEEL(a, d)                                    \
@@ -76,7 +106,7 @@ void qianjin_(uint32_t mm)
 {
     uint32_t p = mm * MOTOR_PULSE_PER_100CM / 1000u;   /* 脉冲数 */
     uint8_t  f = (uint8_t)(MOTOR_FLIP_FWD ? 0x01u : 0x00u);   /* 整轴取反开关 */
-    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPD_H(), MOTOR_SPD_L(), MOTOR_ACC(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
     cmd[7] = (uint8_t)(p >> 16);
@@ -98,7 +128,7 @@ void houtui_(uint32_t mm)
 {
     uint32_t p = mm * MOTOR_PULSE_PER_100CM / 1000u;
     uint8_t  f = (uint8_t)(MOTOR_FLIP_FWD ? 0x01u : 0x00u);   /* 与前进共用同一个整轴开关 */
-    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPD_H(), MOTOR_SPD_L(), MOTOR_ACC(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
     cmd[7] = (uint8_t)(p >> 16);
@@ -120,7 +150,7 @@ void zuo_(uint32_t mm)
 {
     uint32_t p = mm * MOTOR_PULSE_PER_100CM / 1000u;
     uint8_t  f = (uint8_t)(MOTOR_FLIP_LAT ? 0x01u : 0x00u);   /* 左右轴整轴取反开关 */
-    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPD_H(), MOTOR_SPD_L(), MOTOR_ACC(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
     cmd[7] = (uint8_t)(p >> 16);
@@ -141,7 +171,7 @@ void you_(uint32_t mm)
 {
     uint32_t p = mm * MOTOR_PULSE_PER_100CM / 1000u;
     uint8_t  f = (uint8_t)(MOTOR_FLIP_LAT ? 0x01u : 0x00u);   /* 与左平移共用同一个整轴开关 */
-    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPD_H(), MOTOR_SPD_L(), MOTOR_ACC(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
     cmd[7] = (uint8_t)(p >> 16);
@@ -162,7 +192,7 @@ void shun_yaw_(uint32_t deg)
 {
     uint32_t p = deg * MOTOR_PULSE_PER_360DEG / 360u;
     uint8_t  d = (uint8_t)(0x00u ^ MOTOR_YAW_SWAP);   /* 四个轮子同向：0 与 1 是相反的两个转向 */
-    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPD_H(), MOTOR_SPD_L(), MOTOR_ACC(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
     cmd[7] = (uint8_t)(p >> 16);
@@ -183,7 +213,7 @@ void ni_yaw_(uint32_t deg)
 {
     uint32_t p = deg * MOTOR_PULSE_PER_360DEG / 360u;
     uint8_t  d = (uint8_t)(0x01u ^ MOTOR_YAW_SWAP);   /* 四个轮子同向：0 与 1 是相反的两个转向 */
-    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+    uint8_t cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPD_H(), MOTOR_SPD_L(), MOTOR_ACC(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     cmd[6] = (uint8_t)(p >> 24);
     cmd[7] = (uint8_t)(p >> 16);
@@ -209,7 +239,7 @@ void ni_yaw_(uint32_t deg)
 uint32_t motor_rotate_centideg(uint8_t dir, int32_t centi)
 {
     uint32_t deg_abs, p;
-    uint8_t  cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPEED_H, MOTOR_SPEED_L, (uint8_t)MOTOR_ACCEL, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
+    uint8_t  cmd[13] = {0x00, 0xFD, 0x00, MOTOR_SPD_H(), MOTOR_SPD_L(), MOTOR_ACC(), 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x6B};
 
     deg_abs = (uint32_t)((centi > 0L) ? centi : -centi);
     p = deg_abs * MOTOR_PULSE_PER_360DEG / 36000u;
