@@ -396,10 +396,11 @@ static u8 go_to(u16 *cx, u16 *cy, u16 tx, u16 ty)
 /* ============================================================================
  * 调试模式选择（改 DEBUG_MODE 一个数就能切换，几套代码都留在文件里）
  *
- *   DEBUG_MODE_TURN    4 = 闭环旋转单独测试（当前默认，按键触发）
+ *   DEBUG_MODE_VISION  7 = 视觉链路测试（当前默认：发 circle/linear，OLED 显示 K230 回的数据）
+ *   DEBUG_MODE_TURN    4 = 闭环旋转单独测试（按键触发）
  *   DEBUG_MODE_ROUTE   3 = 全图路线 A→E→B→C→D→B→C→D→A
  *   DEBUG_MODE_MOTOR   2 = 电机方向 / 地址自检（换电机后先用它）
- *   DEBUG_MODE_CIRCLE  1 = K230 圆心跟踪
+ *   DEBUG_MODE_CIRCLE  1 = K230 圆心跟踪（旧的纯数字 "x,y" 格式）
  *   DEBUG_MODE_SERVO   0 = 舵机角度按键标定
  *   DEBUG_MODE_CHASSIS 5 = 速度模式底盘自检（chassis.c，F6 + 定时停车）
  *   DEBUG_MODE_WIRELESS 6 = 无线串口底盘测试（USART3 + 上位机 tools/chassis_host.py）
@@ -411,8 +412,9 @@ static u8 go_to(u16 *cx, u16 *cy, u16 tx, u16 ty)
 #define DEBUG_MODE_TURN     4
 #define DEBUG_MODE_CHASSIS  5
 #define DEBUG_MODE_WIRELESS 6
+#define DEBUG_MODE_VISION   7
 
-#define DEBUG_MODE          DEBUG_MODE_WIRELESS
+#define DEBUG_MODE          DEBUG_MODE_VISION
 
 #if DEBUG_MODE == DEBUG_MODE_ROUTE
 
@@ -1705,33 +1707,78 @@ static void servo270_test(void)
 }
 
 /* ============================================================================
- * 夹取物料调试动作（升降舵机 PC7 / 夹爪舵机 PC8 / 旋转舵机 PC9）
+ * 夹取物料调试动作（3 路舵机 + 升降步进电机）
  * ----------------------------------------------------------------------------
- * 上电安全位：旋转 240°、升降 90°、夹爪 65°（Servo_Init 直接输出，见 Servo.h）。
- * PA8 按一次 = 跑完整套动作；跑完停在最后一步，不自动回初始位。
- *   1) 升降 90° → 70°    贴近地面
- *   2) 夹爪 65° → 110°   夹起物料
- *   3) 升降 70° → 170°   抬高物料
- *   4) 旋转 240° → 80°   转到车上
- *   5) 夹爪 110° → 60°   放开物料
- * PA11：动作途中按下 = 立即中止，后续步骤不再执行，停在当前姿势。
- * 每步之后等 GRAB_SETTLE_MS 让舵机转到位；等待期间 PA11 每 1 ms 查一次，照样能打断。
- * 地址 5（物料盘电机）和地址 6（升降步进电机）本动作完全不碰。
+ * 部件：
+ *   升降舵机 PC7  0~270°，初始 90°
+ *   夹爪舵机 PC8  0~270°，初始 65°
+ *   旋转舵机 PC9  0~270°，初始 240°
+ *   升降电机 地址 6：13 字节位置帧，CCW(0x01) = 升高；**绝对位置模式**，
+ *                    "上电位置 = 0"，所以升高 = 绝对 1000 脉冲，回原位 = 绝对 0
+ *
+ * 正向 6 步（PA8 触发）：
+ *   1) 升降舵机 90 → 70      贴近地面
+ *   2) 夹爪舵机 65 → 110     夹起物料
+ *   3) 升降电机 → 1000 脉冲  把物料抬起（CCW）
+ *   4) 升降舵机 70 → 170     抬高
+ *   5) 旋转舵机 240 → 80     转到车上
+ *   6) 夹爪舵机 110 → 60     放开物料   ← 这一步不记入撤销栈
+ *
+ * 栈式复位（正向跑完自动执行）：每执行一个动作就把"反向动作"压栈，
+ * 复位时从栈顶一个个弹出，所以顺序正好是正向的倒序：
+ *   R1 旋转 80 → 240    （退第 5 步）
+ *   R2 升降 170 → 70    （退第 4 步）
+ *   R3 升降电机 → 0     （退第 3 步，CW 下降）
+ *   R4 夹爪 60 → 65     （退第 2 步）
+ *   R5 升降 70 → 90     （退第 1 步）
+ * 第 6 步"放开物料"故意不压栈：复位时不把空夹爪再合回去，夹爪的复位由
+ * 第 2 步记录的反向动作（回 65°）完成。复位结束四个部件都回初始位，可再夹一次。
+ *
+ * PA11：正向、复位两个阶段都能中止；中止 = **停在原地**（不自动找姿态、不自动复位），
+ *       现场手动摆回安全位。中止发生在升降电机运动途中时，会补发一帧"立即停止"。
+ * 地址 5（物料盘电机）本动作完全不碰。
  * ========================================================================== */
-#define GRAB_SETTLE_MS   800u
+#define GRAB_SETTLE_MS        800u    /* 舵机每步等待 */
+#define GRAB_MOTOR_SETTLE_MS  1000u   /* 升降电机每步等待（30 RPM 走 1000 脉冲约 0.63 s） */
+
+#define LIFT_MOTOR_ADDR       0x06u   /* 升降步进电机地址 */
+#define LIFT_MOTOR_SPEED      30u     /* 速度 RPM，和 motor.c 的点动默认速度一致 */
+#define LIFT_MOTOR_ACCEL      100u    /* 加速度档 */
+#define LIFT_MOTOR_HOME       0u      /* 上电位置 = 绝对 0 */
+#define LIFT_MOTOR_UP         2000u   /* 升高 2000 脉冲 */
+
+#define GRAB_UNDO_MAX         8u      /* 撤销栈深度，够 6 步用 */
 
 typedef struct {
-    ServoId  id;          /* 哪个舵机 */
-    uint16_t deg;         /* 目标角度 */
-    char     label[8];    /* OLED / 串口显示用，最多 7 个字符 */
-} GrabStep;
+    uint8_t  is_servo;    /* 1 = 舵机, 0 = 升降步进电机 */
+    ServoId  id;          /* is_servo=1：哪一路舵机 */
+    uint16_t deg;         /* is_servo=1：目标角度 */
+    uint8_t  dir;         /* is_servo=0：0x01 = CCW 升 / 0x00 = CW 降 */
+    uint32_t pulses;      /* is_servo=0：绝对位置脉冲（上电位置 = 0） */
+    uint8_t  undo;        /* 1 = 执行时把反向动作压栈 */
+    char     label[8];    /* 正向步骤显示用，最多 7 个字符 */
+} GrabAction;
 
-static const GrabStep k_grab_steps[] = {
-    { SERVO_LIFT,  70u, "LIFT70"  },
-    { SERVO_GRIP, 110u, "GRIP110" },
-    { SERVO_LIFT, 170u, "LIFT170" },
-    { SERVO_ROT,   80u, "ROT80"   },
-    { SERVO_GRIP,  60u, "GRIP60"  }
+/* 升降舵机已取消，动作表里只剩夹爪舵机、旋转舵机和升降步进电机（地址 6）。
+ * 角度是现场实测标定的：
+ *   旋转：30°  = 夹物料位置（初始）    200° = 放物料位置（满行程）
+ *   夹爪：85°  = 松开                   115° = 夹紧
+ *
+ * 注意：满行程 30 → 200 实测转得太多，现在只转一半（85°），
+ *       即放到 SERVO_ROT_PLACE_DEG = 115°。想改回满行程把下面这个宏改成 200 即可。
+ *
+ *   1) 夹爪 85 → 115      夹起物料
+ *   2) 升降电机 → 2000    把物料抬起（绝对位置、CCW）
+ *   3) 旋转 30 → 115      转半个行程（原来到 200 太多）
+ *   4) 夹爪 115 → 85      放开物料（不压栈）
+ * 复位（压栈弹栈）：旋转→30 → 升降电机→0 → 夹爪→85，倒序退回。 */
+#define SERVO_ROT_PLACE_DEG   115u   /* 转到放料/落料位置的角度：满行程 200，现在用一半 */
+
+static const GrabAction k_grab_steps[] = {
+    { 1u, SERVO_GRIP, 115u, 0u,    0u,            1u, "GRIP115" },
+    { 0u, SERVO_ROT,    0u, 0x01u, LIFT_MOTOR_UP, 1u, "MOT2000"  },
+    { 1u, SERVO_ROT, SERVO_ROT_PLACE_DEG, 0u, 0u, 1u, "ROT"     },
+    { 1u, SERVO_GRIP,  85u, 0u,    0u,            0u, "GRIP85"  }   /* 放开物料：不压栈 */
 };
 
 #define GRAB_STEP_COUNT   ((uint8_t)(sizeof(k_grab_steps) / sizeof(k_grab_steps[0])))
@@ -1742,42 +1789,151 @@ static const GrabStep k_grab_steps[] = {
 #define GRAB_DONE    2u
 #define GRAB_ABORT   3u
 
-/* PA8 当启动键：上拉输入，按下接地。Key_GetNum() 只扫 PB1/PB11/PB10/PA12/PA11，
- * 所以 PA8 在这里单独初始化、单独读。 */
+/* 撤销栈 + 升降电机当前被命令到的绝对位置（只用于显示） */
+static GrabAction g_undo[GRAB_UNDO_MAX];
+static uint8_t    g_undo_n = 0u;
+static uint32_t   g_lift_target = LIFT_MOTOR_HOME;
+
+/* 升降步进电机（地址 6）：绝对位置模式、立即执行 */
+static void lift_motor_move(uint32_t abs_pulses, uint8_t dir)
+{
+    uint8_t cmd[13] = {
+        LIFT_MOTOR_ADDR,
+        0xFD,                                            /* 位置模式 */
+        dir,                                             /* 0x01 = CCW 升 */
+        (uint8_t)(LIFT_MOTOR_SPEED >> 8),
+        (uint8_t)(LIFT_MOTOR_SPEED & 0xFFu),
+        (uint8_t)LIFT_MOTOR_ACCEL,
+        0x00, 0x00, 0x00, 0x00,                          /* 脉冲数，下面填 */
+        0x01,                                            /* 绝对位置：目标 = 上电位置起的脉冲数 */
+        0x00,                                            /* 立即执行 */
+        0x6B
+    };
+
+    cmd[6] = (uint8_t)(abs_pulses >> 24);
+    cmd[7] = (uint8_t)(abs_pulses >> 16);
+    cmd[8] = (uint8_t)(abs_pulses >> 8);
+    cmd[9] = (uint8_t)abs_pulses;
+
+    Serial_SendArray(cmd, 13);
+    Delay_ms(5);
+
+    g_lift_target = abs_pulses;
+}
+
+/* 立即停止（0xFE 0x98）：中止时用，别让它继续往目标位置走 */
+static void lift_motor_stop(void)
+{
+    Serial_SendByte(LIFT_MOTOR_ADDR);
+    Serial_SendByte(0xFE);
+    Serial_SendByte(0x98);
+    Serial_SendByte(0x00);
+    Serial_SendByte(0x6B);
+    Delay_ms(5);
+}
+
+/* —— 按键极性 ——
+ * 本板按键：一脚接 3.3V、一脚接单片机引脚 → **按下时引脚变高**，
+ * 所以按键脚统一配下拉输入（IPD），读到高电平 = 按下。
+ * 如果以后换成"按下接 GND"的按键，把下面改成 0 并把 IPD 换成 IPU 即可。 */
+#define GRAB_KEY_ACTIVE_HIGH   1
+
+#if GRAB_KEY_ACTIVE_HIGH
+  #define GRAB_KEY_MODE        GPIO_Mode_IPD
+#else
+  #define GRAB_KEY_MODE        GPIO_Mode_IPU
+#endif
+
+/* 读一个按键：1 = 按下 */
+static uint8_t grab_key_down(GPIO_TypeDef *port, uint16_t pin)
+{
+#if GRAB_KEY_ACTIVE_HIGH
+    return (GPIO_ReadInputDataBit(port, pin) == Bit_SET) ? 1u : 0u;
+#else
+    return (GPIO_ReadInputDataBit(port, pin) == Bit_RESET) ? 1u : 0u;
+#endif
+}
+
+/* 按键初始化：PB1（单步）、PA7（连跑）、PA5（中止），全部下拉输入
+ * （按键资源：PB1 / PA7 / PA5；按下时引脚变高）。
+ * 不再使用 PA8/PA11/PA12：PA12 是 USB D+，板上有 1.5k 上拉，
+ * 会被一直读成"按下"，从而卡在"等松手"里，导致按 PB1 完全没反应。 */
 static void grab_key_init(void)
 {
     GPIO_InitTypeDef gpio;
 
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
-    gpio.GPIO_Pin   = GPIO_Pin_8;
-    gpio.GPIO_Mode  = GPIO_Mode_IPU;
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB, ENABLE);
+    gpio.GPIO_Mode  = GRAB_KEY_MODE;
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
+
+    gpio.GPIO_Pin   = GPIO_Pin_7 | GPIO_Pin_5;      /* PA7 = 连跑、PA5 = 中止 */
     GPIO_Init(GPIOA, &gpio);
+
+    gpio.GPIO_Pin   = GPIO_Pin_1;                   /* PB1 = 单步 */
+    GPIO_Init(GPIOB, &gpio);
 }
 
-/* PA8 按了一下：20 ms 消抖 + 等松手，有按下返回 1 */
+/* 等松手，最多等 2 s（400 × 5 ms）。加超时是为了防止某个按键脚被外部一直拉高，
+ * 让程序永远卡在"等松手"里，表现成"按键全都没反应"。返回 1 = 真的松手了。 */
+#define GRAB_RELEASE_TIMEOUT   400u
+
+static uint8_t grab_wait_release(GPIO_TypeDef *port, uint16_t pin)
+{
+    uint16_t t;
+
+    for(t = 0; t < GRAB_RELEASE_TIMEOUT; t++){
+        if(!grab_key_down(port, pin)) return 1u;
+        Delay_ms(5);
+    }
+    return 0u;
+}
+
+/* 连跑键 PA7：20 ms 消抖 + 等松手，有按下返回 1 */
 static uint8_t grab_start_hit(void)
 {
-    if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) != Bit_RESET) return 0;
+    if(!grab_key_down(GPIOA, GPIO_Pin_7)) return 0;
 
     Delay_ms(20);
-    if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) != Bit_RESET) return 0;
+    if(!grab_key_down(GPIOA, GPIO_Pin_7)) return 0;
 
-    while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET) Delay_ms(10);
+    grab_wait_release(GPIOA, GPIO_Pin_7);      /* 等松手（带超时，不会卡死） */
     Delay_ms(20);
     return 1;
 }
 
-/* PA11 中止键：按下后等松手再返回 1，避免一直按着被重复判定 */
+/* 单步键 PB1：20 ms 消抖 + 等松手，有按下返回 1 */
+static uint8_t grab_step_hit(void)
+{
+    if(!grab_key_down(GPIOB, GPIO_Pin_1)) return 0u;
+
+    Delay_ms(20);
+
+    if(!grab_key_down(GPIOB, GPIO_Pin_1)) return 0u;          /* 抖动 */
+
+    grab_wait_release(GPIOB, GPIO_Pin_1);                    /* 等松手（带超时） */
+
+    Delay_ms(20);
+    return 1u;
+}
+
+/* 每做完一个动作闪一下 PC13：确认"按键被识别、动作执行了" */
+static void pc13_step_blink(void)
+{
+    GPIO_ResetBits(GPIOC, GPIO_Pin_13);   /* 亮（低电平点亮） */
+    Delay_ms(60);
+    GPIO_SetBits(GPIOC, GPIO_Pin_13);     /* 灭 */
+}
+
+/* 中止键 PA5：按下后等松手再返回 1，避免一直按着被重复判定 */
 static uint8_t grab_abort_hit(void)
 {
-    if(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) != Bit_RESET) return 0;
+    if(!grab_key_down(GPIOA, GPIO_Pin_5)) return 0;
 
-    while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) == Bit_RESET) Delay_ms(5);
+    grab_wait_release(GPIOA, GPIO_Pin_5);
     return 1;
 }
 
-/* 等 ms 毫秒；期间 PA11 按下立刻返回 0（中止本次动作） */
+/* 等 ms 毫秒；期间 PA5 按下立刻返回 0（中止本次动作） */
 static uint8_t grab_wait(uint16_t ms)
 {
     uint16_t t;
@@ -1789,86 +1945,1265 @@ static uint8_t grab_wait(uint16_t ms)
     return 1;
 }
 
-/* 画界面：step = 已完成/正在做的步数（0 = 还没开始），state 决定第 4 行。
- * 第 2、3 行显示的是三个舵机的实际角度（含微调），不是目标角度。 */
-static void grab_show(uint8_t step, uint8_t state)
+/* 执行一个动作并等它到位；PA11 按下返回 0（中止，动作停在原地） */
+static uint8_t grab_exec(const GrabAction *a)
 {
-    /* 第 1 行：GRAB 2/5 GRIP110 */
+    if(a->is_servo){
+        Servo_SetAngle(a->id, a->deg);
+        return grab_wait(GRAB_SETTLE_MS);
+    }
+
+    lift_motor_move(a->pulses, a->dir);
+    if(!grab_wait(GRAB_MOTOR_SETTLE_MS)){
+        lift_motor_stop();            /* 中止：先让它停下，别继续走完 */
+        return 0;
+    }
+    return 1;
+}
+
+/* 把一个动作的反向动作压栈：
+ *   舵机 → (同一路, 执行前的实际角度)
+ *   电机 → 回 LIFT_MOTOR_HOME（上电位置 0），方向 CW 下降 */
+static void grab_record_undo(const GrabAction *a)
+{
+    GrabAction inv;
+
+    if(!a->undo || g_undo_n >= GRAB_UNDO_MAX) return;
+
+    inv.is_servo = a->is_servo;
+    inv.id       = a->id;
+    inv.deg      = 0u;
+    inv.dir      = 0u;
+    inv.pulses   = 0u;
+    inv.undo     = 0u;
+    inv.label[0] = '\0';
+
+    if(a->is_servo){
+        inv.deg = Servo_GetAngle(a->id);              /* 执行前的角度 */
+    }else{
+        inv.pulses = LIFT_MOTOR_HOME;
+        inv.dir    = 0x00u;                          /* 回 0 = 下降 = CW */
+    }
+
+    g_undo[g_undo_n++] = inv;
+}
+
+/* 第 4 行状态 */
+static void grab_show_state(uint8_t state)
+{
+    switch(state){
+        case GRAB_BUSY:  OLED_ShowString(4, 1, "BUSY...         "); break;
+        case GRAB_DONE:  OLED_ShowString(4, 1, "DONE HOME       "); break;
+        case GRAB_ABORT: OLED_ShowString(4, 1, "ABORT BY PA5    "); break;
+        default:         OLED_ShowString(4, 1, "PB1:STEP PA7:RUN"); break;
+    }
+}
+
+/* 第 2、3 行：两个舵机的实际角度 + 升降电机当前目标位置 */
+static void grab_show_angles(void)
+{
+    uint16_t rot  = Servo_GetAngle(SERVO_ROT);
+    uint16_t grip = Servo_GetAngle(SERVO_GRIP);
+
+    /* 第 2 行：ROT:30（当前旋转角度） */
+    OLED_ShowString(2, 1, "                ");
+    OLED_ShowString(2, 1, "ROT:");
+    OLED_ShowNum(2, 5, rot, oled_digits(rot));
+
+    /* 第 3 行：GRP:85 M:2000（M = 升降电机目标脉冲） */
+    OLED_ShowString(3, 1, "                ");
+    OLED_ShowString(3, 1, "GRP:");
+    OLED_ShowNum(3, 5, grip, oled_digits(grip));
+    OLED_ShowString(3, 9, "M:");
+    OLED_ShowNum(3, 11, g_lift_target, oled_digits(g_lift_target));
+}
+
+/* 待机 / 完成画面 */
+static void grab_show_idle(uint8_t state)
+{
+    OLED_ShowString(1, 1, "                ");
+    OLED_ShowString(1, 1, "GRAB  ");
+    OLED_ShowString(1, 7, (state == GRAB_DONE) ? "DONE " : "READY");
+    grab_show_angles();
+    grab_show_state(state);
+}
+
+/* 正向第 step 步的画面：GRAB 3/4 ROT200 */
+static void grab_show_forward(uint8_t step, uint8_t state)
+{
     OLED_ShowString(1, 1, "                ");
     OLED_ShowString(1, 1, "GRAB ");
     OLED_ShowNum(1, 6, step, 1);
-    OLED_ShowString(1, 7, "/5");
+    OLED_ShowString(1, 7, "/");
+    OLED_ShowNum(1, 8, GRAB_STEP_COUNT, 1);
     if(step > 0u){
         OLED_ShowString(1, 10, (char *)k_grab_steps[step - 1u].label);
     }
 
-    /* 第 2 行：ROT:240 LFT:170 （角度最多 3 位，列位置固定，不会串行） */
-    OLED_ShowString(2, 1, "                ");
-    OLED_ShowString(2, 1, "ROT:");
-    OLED_ShowNum(2, 5, Servo_GetAngle(SERVO_ROT), oled_digits(Servo_GetAngle(SERVO_ROT)));
-    OLED_ShowString(2, 9, "LFT:");
-    OLED_ShowNum(2, 13, Servo_GetAngle(SERVO_LIFT), oled_digits(Servo_GetAngle(SERVO_LIFT)));
-
-    /* 第 3 行：GRP:65 */
-    OLED_ShowString(3, 1, "                ");
-    OLED_ShowString(3, 1, "GRP:");
-    OLED_ShowNum(3, 5, Servo_GetAngle(SERVO_GRIP), oled_digits(Servo_GetAngle(SERVO_GRIP)));
-
-    switch(state){
-        case GRAB_BUSY:  OLED_ShowString(4, 1, "BUSY...         "); break;
-        case GRAB_DONE:  OLED_ShowString(4, 1, "DONE            "); break;
-        case GRAB_ABORT: OLED_ShowString(4, 1, "ABORT BY PA11   "); break;
-        default:         OLED_ShowString(4, 1, "PA8:START       "); break;
-    }
+    grab_show_angles();
+    grab_show_state(state);
 }
 
-/* 夹取动作主循环：不返回。 */
+/* 复位第 n 步的画面：BACK 2/5 */
+static void grab_show_back(uint8_t n, uint8_t total, uint8_t state)
+{
+    OLED_ShowString(1, 1, "                ");
+    OLED_ShowString(1, 1, "BACK ");
+    OLED_ShowNum(1, 6, n, 1);
+    OLED_ShowString(1, 7, "/");
+    OLED_ShowNum(1, 8, total, 1);
+
+    grab_show_angles();
+    grab_show_state(state);
+}
+
+/* ============================================================================
+ * 单步 / 连跑状态（供 PB1 单步、PA8 连跑共用）
+ * ----------------------------------------------------------------------------
+ * g_fwd_done   正向已经执行了几步（0~GRAB_STEP_COUNT）
+ * g_undo_total 进入复位阶段时撤销栈里有多少个动作
+ * g_undo_done  复位已经退了几步
+ * ========================================================================== */
+#define GRAB_PH_IDLE  0u
+#define GRAB_PH_FWD   1u
+#define GRAB_PH_UNDO  2u
+#define GRAB_PH_DONE  3u
+
+static uint8_t g_grab_phase  = GRAB_PH_IDLE;
+static uint8_t g_fwd_done    = 0u;
+static uint8_t g_undo_total  = 0u;
+static uint8_t g_undo_done   = 0u;
+
+/* 从待机重来：清空撤销栈和所有计数 */
+static void grab_reset_state(void)
+{
+    g_undo_n     = 0u;
+    g_fwd_done   = 0u;
+    g_undo_total = 0u;
+    g_undo_done  = 0u;
+    g_grab_phase = GRAB_PH_IDLE;
+}
+
+/* 执行"一个"动作（正向或复位都算），供 PB1 单步用；返回 0 = 被 PA11 中止。
+ * PB1 每按一次就前进一个动作：正向 4 步走完自动进入复位阶段，再一步步弹栈。 */
+static uint8_t grab_step_once(void)
+{
+    GrabAction a;
+
+    if(g_grab_phase == GRAB_PH_IDLE) g_grab_phase = GRAB_PH_FWD;
+
+    /* 正向走完 -> 切到复位阶段 */
+    if(g_grab_phase == GRAB_PH_FWD && g_fwd_done >= GRAB_STEP_COUNT){
+        g_grab_phase = GRAB_PH_UNDO;
+        g_undo_total = g_undo_n;
+    }
+
+    if(g_grab_phase == GRAB_PH_FWD){
+        grab_record_undo(&k_grab_steps[g_fwd_done]);
+        grab_show_forward((uint8_t)(g_fwd_done + 1u), GRAB_BUSY);
+
+        if(k_grab_steps[g_fwd_done].is_servo){
+            USART3_Printf("[S%u] %s -> %u deg\r\n", (unsigned)(g_fwd_done + 1u),
+                          k_grab_steps[g_fwd_done].label,
+                          (unsigned)k_grab_steps[g_fwd_done].deg);
+        }else{
+            USART3_Printf("[S%u] %s -> %u pulse (abs, CCW)\r\n", (unsigned)(g_fwd_done + 1u),
+                          k_grab_steps[g_fwd_done].label,
+                          (unsigned)k_grab_steps[g_fwd_done].pulses);
+        }
+
+        if(!grab_exec(&k_grab_steps[g_fwd_done])) return 0;
+        g_fwd_done++;
+
+        if(g_fwd_done >= GRAB_STEP_COUNT){
+            g_grab_phase = GRAB_PH_UNDO;
+            g_undo_total = g_undo_n;
+        }
+        return 1;
+    }
+
+    if(g_grab_phase == GRAB_PH_UNDO){
+        if(g_undo_n == 0u){
+            g_grab_phase = GRAB_PH_DONE;
+            return 1;
+        }
+
+        a = g_undo[--g_undo_n];                 /* 后进先出：最后做的先退 */
+        g_undo_done++;
+
+        grab_show_back(g_undo_done, g_undo_total, GRAB_BUSY);
+        USART3_Printf("[R%u/%u] %s -> %u\r\n", (unsigned)g_undo_done, (unsigned)g_undo_total,
+                      a.is_servo ? "SERVO" : "LIFT-MOTOR",
+                      (unsigned)(a.is_servo ? a.deg : a.pulses));
+
+        if(!grab_exec(&a)) return 0;
+
+        if(g_undo_n == 0u) g_grab_phase = GRAB_PH_DONE;
+        return 1;
+    }
+
+    return 1;                                   /* 已经做完了 */
+}
+
+/* 上电自检动作：让两个舵机各走一次可见的往返，用来区分"引脚没输出"还是"舵机/供电问题"。
+ *   旋转（PA1）：30° → 115° → 30°
+ *   夹爪（PA0）：85° → 115° → 85°
+ * 不想每次上电都动，把 GRAB_BOOT_SELFTEST 改成 0。 */
+#define GRAB_BOOT_SELFTEST   0
+
+static void grab_boot_selftest(void)
+{
+#if GRAB_BOOT_SELFTEST
+    OLED_ShowString(1, 1, "SELFTEST ROT    ");
+    Servo_SetAngle(SERVO_ROT, SERVO_ROT_PLACE_DEG);
+    Delay_ms(800);
+    Servo_SetAngle(SERVO_ROT, SERVO_ROT_INIT_DEG);
+    Delay_ms(800);
+
+    OLED_ShowString(1, 1, "SELFTEST GRIP   ");
+    Servo_SetAngle(SERVO_GRIP, 115u);
+    Delay_ms(800);
+    Servo_SetAngle(SERVO_GRIP, SERVO_GRIP_INIT_DEG);
+    Delay_ms(800);
+    OLED_ShowString(1, 1, "                ");
+#endif
+}
+
+/* 夹取动作主循环：不返回。
+ *   PB1 ：单步——每按一次只做一个动作（正向 4 步做完后自动进入复位，再一步步弹栈）
+ *   PA7 ：连跑——正向 4 步 + 栈式复位，然后回到待机
+ *   PA5 ：中止——停在原地
+ * 每做完一个动作 PC13 会闪一下，OLED 上也能看到当前步骤。
+ */
 static void grab_run_once(void)
 {
-    uint8_t i, step, ok;
+    uint8_t ok;
 
     /* 上电安全位（Servo_Init 里已经输出过，这里再确认一次，重进本函数时也一致） */
     Servo_SetAngle(SERVO_ROT,  SERVO_ROT_INIT_DEG);
-    Servo_SetAngle(SERVO_LIFT, SERVO_LIFT_INIT_DEG);
     Servo_SetAngle(SERVO_GRIP, SERVO_GRIP_INIT_DEG);
 
     grab_key_init();
 
     OLED_Clear();
-    grab_show(0u, GRAB_READY);
-    USART3_SendString("\r\nGRAB READY: PA8=START PA11=ABORT\r\n");
+    grab_boot_selftest();          /* 旋转 240→80→240、夹爪 65→110→65 */
+    grab_show_idle(GRAB_READY);
+    USART3_SendString("\r\nGRAB READY: PB1=STEP PA7=RUN PA5=ABORT\r\n");
 
     while(1){
-        if(!grab_start_hit()){
+        /* ---------- PA7：连跑整套 ---------- */
+        if(grab_start_hit()){
+            grab_reset_state();
+            motor_enable_addr(LIFT_MOTOR_ADDR);     /* 地址 6 上电默认失能，跑之前先使能 */
+            Delay_ms(20);
+
+            USART3_SendString("[RUN] START (auto)\r\n");
+
+            ok = 1u;
+            while(g_grab_phase != GRAB_PH_DONE){
+                if(!grab_step_once()){ ok = 0u; break; }
+                pc13_step_blink();                  /* 每步闪一下 LED */
+            }
+
+            if(ok){
+                grab_show_idle(GRAB_DONE);
+                USART3_SendString("[RUN] DONE (back home, ready)\r\n");
+            }else{
+                grab_show_angles();
+                grab_show_state(GRAB_ABORT);
+                USART3_SendString("[RUN] ABORT BY PA5 - stopped in place\r\n");
+            }
+
+            /* 收尾：等 PA7 松手，避免按住不放连着再跑一遍 */
+            while(grab_key_down(GPIOA, GPIO_Pin_7)) Delay_ms(10);
+            continue;
+        }
+
+        /* ---------- PB1：单步 ---------- */
+        if(grab_step_hit()){
+            if(g_grab_phase == GRAB_PH_DONE) grab_reset_state();   /* 上一轮做完了：重新开始 */
+
+            motor_enable_addr(LIFT_MOTOR_ADDR);     /* 每次单步前都保证地址 6 已使能 */
+            Delay_ms(10);
+
+            USART3_Printf("[STEP] phase=%u fwd=%u undo=%u\r\n",
+                          (unsigned)g_grab_phase, (unsigned)g_fwd_done, (unsigned)g_undo_done);
+
+            if(grab_step_once()){
+                pc13_step_blink();                  /* 按键被识别 + 动作执行：闪一下 */
+                if(g_grab_phase == GRAB_PH_DONE){
+                    grab_show_idle(GRAB_DONE);
+                    USART3_SendString("[STEP] DONE (back home)\r\n");
+                }
+            }else{
+                grab_show_angles();
+                grab_show_state(GRAB_ABORT);
+                USART3_SendString("[STEP] ABORT BY PA5\r\n");
+            }
+
+            continue;
+        }
+
+        Delay_ms(5);
+    }
+}
+
+/* ============================================================================
+ * 舵机手动调节测试（当前使用的测试）
+ * ----------------------------------------------------------------------------
+ * 三个按键（都是"按下为高"，已配下拉输入）：
+ *   PA5 = 切换当前调节的舵机：旋转(PA1) ⇄ 夹爪(PA0)
+ *   PB1 = 当前舵机角度 +10°
+ *   PA7 = 当前舵机角度 -10°
+ *
+ * 角度范围 0~270°；到边界后再按不会变化（不会顶到机械限位死顶）。
+ * 每次按键 PC13 闪一下，确认按键被识别。
+ *
+ * OLED：
+ *   第 1 行  SERVO TUNE
+ *   第 2 行  SEL:ROT 240      选中的舵机 + 逻辑角度
+ *   第 3 行  PUL:722 us       实际输出脉宽（旋转已取反，所以 240° = 722 us）
+ *   第 4 行  PB1+ PA7- PA5:SW 按键提示
+ * ========================================================================== */
+static void servo_tune_test(void)
+{
+    uint8_t  sel = (uint8_t)SERVO_ROT;      /* 当前调节哪一路 */
+    uint16_t ang[SERVO_COUNT];              /* 两路的逻辑角度 */
+    uint16_t pulse;
+    uint8_t  dirty = 1u;
+
+    /* 上电先到安全角度 */
+    ang[SERVO_ROT]  = SERVO_ROT_INIT_DEG;
+    ang[SERVO_GRIP] = SERVO_GRIP_INIT_DEG;
+    Servo_SetAngle(SERVO_ROT,  ang[SERVO_ROT]);
+    Servo_SetAngle(SERVO_GRIP, ang[SERVO_GRIP]);
+
+    grab_key_init();                        /* PB1 / PA7 / PA5 下拉输入 */
+
+    OLED_Clear();
+    OLED_ShowString(1, 1, "SERVO TUNE      ");
+    OLED_ShowString(4, 1, "PB1+ PA7- PA5:SW");
+
+    while(1){
+        /* ---------- PA5：切换舵机 ---------- */
+        if(grab_key_down(GPIOA, GPIO_Pin_5)){
+            Delay_ms(20);
+            if(grab_key_down(GPIOA, GPIO_Pin_5)){
+                grab_wait_release(GPIOA, GPIO_Pin_5);
+                Delay_ms(20);
+                sel = (sel == (uint8_t)SERVO_ROT) ? (uint8_t)SERVO_GRIP : (uint8_t)SERVO_ROT;
+                dirty = 1u;
+                pc13_step_blink();
+                continue;
+            }
+        }
+
+        /* ---------- PB1：+10° ---------- */
+        if(grab_key_down(GPIOB, GPIO_Pin_1)){
+            Delay_ms(20);
+            if(grab_key_down(GPIOB, GPIO_Pin_1)){
+                grab_wait_release(GPIOB, GPIO_Pin_1);
+                Delay_ms(20);
+                if((uint16_t)(ang[sel] + 10u) <= SERVO_ANGLE_MAX){
+                    ang[sel] = (uint16_t)(ang[sel] + 10u);
+                    Servo_SetAngle((ServoId)sel, ang[sel]);
+                    dirty = 1u;
+                }
+                pc13_step_blink();
+                continue;
+            }
+        }
+
+        /* ---------- PA7：-10° ---------- */
+        if(grab_key_down(GPIOA, GPIO_Pin_7)){
+            Delay_ms(20);
+            if(grab_key_down(GPIOA, GPIO_Pin_7)){
+                grab_wait_release(GPIOA, GPIO_Pin_7);
+                Delay_ms(20);
+                if(ang[sel] >= 10u){
+                    ang[sel] = (uint16_t)(ang[sel] - 10u);
+                    Servo_SetAngle((ServoId)sel, ang[sel]);
+                    dirty = 1u;
+                }
+                pc13_step_blink();
+                continue;
+            }
+        }
+
+        /* ---------- 显示刷新（只在角度/选择变化时刷） ---------- */
+        if(dirty){
+            dirty = 0u;
+            pulse = Servo_GetPulse((ServoId)sel);
+
+            OLED_ShowString(2, 1, "SEL:            ");        /* 先清整行，避免旧数字残留 */
+            OLED_ShowString(2, 1, "SEL:");
+            OLED_ShowString(2, 5, (sel == (uint8_t)SERVO_ROT) ? "ROT " : "GRP ");
+            OLED_ShowNum(2, 9, ang[sel], oled_digits(ang[sel]));
+
+            OLED_ShowString(3, 1, "PUL:            ");
+            OLED_ShowString(3, 1, "PUL:");
+            OLED_ShowNum(3, 5, pulse, oled_digits(pulse));
+            OLED_ShowString(3, 9, "us");
+
+            /* 到边界时给个提示，方便知道"再按也不会动" */
+            if(ang[sel] >= SERVO_ANGLE_MAX)      OLED_ShowString(3, 12, "MAX");
+            else if(ang[sel] == 0u)              OLED_ShowString(3, 12, "MIN");
+            else                                 OLED_ShowString(3, 12, "   ");
+        }
+
+        Delay_ms(5);
+    }
+}
+
+/* ============================================================================
+ * 小车移动测试（当前使用的测试）
+ * ----------------------------------------------------------------------------
+ *   PA5 = 切换模式（循环）：
+ *           模式 1：前进 / 后退
+ *           模式 2：左平移 / 右平移
+ *           模式 3：顺时针 / 逆时针旋转
+ *   PB1 = 正向（前进 / 左移 / 顺时针）
+ *   PA7 = 反向（后退 / 右移 / 逆时针）
+ *
+ * 每按一次走一小段（可在下面两个宏里改）：
+ *   直线/平移 CAR_STEP_MM 毫米，旋转 CAR_STEP_DEG 度。
+ * 运动本身是非阻塞的：命令下发后电机自己走完，程序立刻回到按键扫描。
+ *
+ * OLED：
+ *   第 1 行  CAR TEST  M1/3
+ *   第 2 行  MODE: FWD/BWD
+ *   第 3 行  STEP:200mm 45dg
+ *   第 4 行  >FWD  （刚执行的方向）
+ * 每次按键 PC13 闪一下。
+ * ========================================================================== */
+#define CAR_STEP_MM      200u    /* 每次前进/后退/平移多少毫米 */
+#define CAR_STEP_DEG      45u    /* 每次旋转多少度 */
+
+#define CAR_MODE_FWD     0u      /* 前进/后退 */
+#define CAR_MODE_LAT     1u      /* 左右平移 */
+#define CAR_MODE_YAW     2u      /* 顺/逆时针 */
+#define CAR_MODE_COUNT   3u
+
+static void car_show_mode(uint8_t mode)
+{
+    /* 第 1 行：CAR TEST  M1/3 */
+    OLED_ShowString(1, 1, "CAR TEST  M     ");
+    OLED_ShowNum(1, 12, (uint32_t)(mode + 1u), 1);
+    OLED_ShowString(1, 13, "/3");
+
+    /* 第 2 行：这个模式的两个方向 */
+    OLED_ShowString(2, 1, "MODE:           ");
+    if(mode == CAR_MODE_FWD)      OLED_ShowString(2, 7, "FWD/BWD ");
+    else if(mode == CAR_MODE_LAT) OLED_ShowString(2, 7, "LEFT/RGT");
+    else                          OLED_ShowString(2, 7, "CW/CCW  ");
+}
+
+/* 执行一次移动；fwd = 1 正向，0 反向。返回显示用的短名字 */
+static const char *car_action(uint8_t mode, uint8_t fwd)
+{
+    if(mode == CAR_MODE_FWD){
+        if(fwd){ qianjin_(CAR_STEP_MM); return "FWD "; }
+        houtui_(CAR_STEP_MM);
+        return "BWD ";
+    }
+
+    if(mode == CAR_MODE_LAT){
+        if(fwd){ zuo_(CAR_STEP_MM); return "LEFT "; }
+        you_(CAR_STEP_MM);
+        return "RIGHT";
+    }
+
+    if(fwd){ shun_yaw_(CAR_STEP_DEG); return "CW  "; }
+    ni_yaw_(CAR_STEP_DEG);
+    return "CCW ";
+}
+
+static void car_move_test(void)
+{
+    uint8_t     mode = CAR_MODE_FWD;
+    const char *name;
+
+    grab_key_init();                 /* PB1 / PA7 / PA5：下拉输入，按下为高 */
+
+    OLED_Clear();
+    OLED_ShowString(3, 1, "STEP:200mm 45dg ");
+    OLED_ShowString(4, 1, "PA5:MODE        ");
+    car_show_mode(mode);
+
+    while(1){
+        /* ---------- PA5：切换模式 ---------- */
+        if(grab_key_down(GPIOA, GPIO_Pin_5)){
+            Delay_ms(20);
+            if(grab_key_down(GPIOA, GPIO_Pin_5)){
+                grab_wait_release(GPIOA, GPIO_Pin_5);
+                Delay_ms(20);
+                mode = (uint8_t)((mode + 1u) % CAR_MODE_COUNT);
+                car_show_mode(mode);
+                pc13_step_blink();
+                continue;
+            }
+        }
+
+        /* ---------- PB1：正向 ---------- */
+        if(grab_key_down(GPIOB, GPIO_Pin_1)){
+            Delay_ms(20);
+            if(grab_key_down(GPIOB, GPIO_Pin_1)){
+                grab_wait_release(GPIOB, GPIO_Pin_1);
+                Delay_ms(20);
+                name = car_action(mode, 1u);
+                OLED_ShowString(4, 1, "                ");
+                OLED_ShowString(4, 1, ">");
+                OLED_ShowString(4, 2, (char *)name);
+                pc13_step_blink();
+                continue;
+            }
+        }
+
+        /* ---------- PA7：反向 ---------- */
+        if(grab_key_down(GPIOA, GPIO_Pin_7)){
+            Delay_ms(20);
+            if(grab_key_down(GPIOA, GPIO_Pin_7)){
+                grab_wait_release(GPIOA, GPIO_Pin_7);
+                Delay_ms(20);
+                name = car_action(mode, 0u);
+                OLED_ShowString(4, 1, "                ");
+                OLED_ShowString(4, 1, ">");
+                OLED_ShowString(4, 2, (char *)name);
+                pc13_step_blink();
+                continue;
+            }
+        }
+
+        Delay_ms(5);
+    }
+}
+
+/* ============================================================================
+ * USART2 引脚自检（测试 PA2 = TX、PA3 = RX 是不是好的）
+ * ----------------------------------------------------------------------------
+ * 做三件事：
+ *   1) 电气自检：把 PA2/PA3 依次配成上拉、下拉再读回。
+ *      正常引脚会跟随（上拉读到 1、下拉读到 0）；一直读 0 = 短地/损坏。
+ *   2) 自环测试：从 PA2 发 6 个字节，再在 PA3 上等回环。
+ *      ★ 需要把 PA2 和 PA3 用一根杜邦线短接（不需要别的设备）。
+ *   3) 在线测试：之后每 0.5 s 往 PA2 发一行 "PA2TEST"，
+ *      同时把 PA3 收到的字节计数并显示最后一个字节。
+ *      - USB-TTL 的 RX 接 PA2 → 串口助手应看到 PA2TEST
+ *      - USB-TTL 的 TX 接 PA3 → OLED 的 RX 计数会增加、显示最后收到的字节
+ *
+ * OLED：
+ *   1 行  USART2 PIN TEST
+ *   2 行  PA2:OK  PA3:OK     （电气跟随）
+ *   3 行  LOOP:OK / LOOP:FAIL（自环，未短接就是 FAIL，正常）
+ *   4 行  TX:12 RX:3 5A      （已发几行 / 收到几字节 / 最后一字节）
+ * LED：自环通过 PC13 闪 2 下，失败闪 5 下。
+ * ========================================================================== */
+#define PIN_TMO        40000u    /* 等一个回环字节的轮询上限（约几毫秒） */
+#define PIN_LIVE_MS    500u      /* 在线测试：每 500 ms 发一行 */
+
+/* 把某个脚先上拉读、再下拉读，判断它能不能跟随（= 电气基本正常） */
+static uint8_t pin_follows_pull(GPIO_TypeDef *port, uint16_t pin)
+{
+    GPIO_InitTypeDef g;
+    uint8_t up, down;
+
+    g.GPIO_Pin   = pin;
+    g.GPIO_Speed = GPIO_Speed_50MHz;
+
+    g.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_Init(port, &g);
+    Delay_ms(2);
+    up = (GPIO_ReadInputDataBit(port, pin) == Bit_SET) ? 1u : 0u;
+
+    g.GPIO_Mode = GPIO_Mode_IPD;
+    GPIO_Init(port, &g);
+    Delay_ms(2);
+    down = (GPIO_ReadInputDataBit(port, pin) == Bit_SET) ? 1u : 0u;
+
+    return (up == 1u && down == 0u) ? 1u : 0u;
+}
+
+/* PA2/PA3 恢复成串口引脚：PA2 = AF_PP(TX)，PA3 = IPU(RX) */
+static void usart2_pins_restore(void)
+{
+    GPIO_InitTypeDef g;
+
+    g.GPIO_Pin   = GPIO_Pin_2;
+    g.GPIO_Mode  = GPIO_Mode_AF_PP;
+    g.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOA, &g);
+
+    g.GPIO_Pin   = GPIO_Pin_3;
+    g.GPIO_Mode  = GPIO_Mode_IPU;
+    GPIO_Init(GPIOA, &g);
+}
+
+/* 自环：PA2 发 → PA3 收，逐字节比对；需要 PA2-PA3 短接 */
+static uint8_t usart2_loopback(void)
+{
+    static const uint8_t pat[] = { 0x55u, 0xAAu, 0x00u, 0xFFu, 0x41u, 0x42u };
+    uint8_t  i, rx;
+    uint32_t t;
+
+    /* 先清掉可能残留的接收字节 */
+    while (USART_GetFlagStatus(USART2, USART_FLAG_RXNE) == SET)
+    {
+        (void)USART_ReceiveData(USART2);
+    }
+
+    for (i = 0; i < (uint8_t)sizeof(pat); i++)
+    {
+        USART_SendData(USART2, pat[i]);
+        while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET) { }
+
+        t = 0;
+        while (USART_GetFlagStatus(USART2, USART_FLAG_RXNE) == RESET)
+        {
+            if (++t > PIN_TMO) return 0u;              /* 没等到回环 */
+        }
+
+        rx = (uint8_t)USART_ReceiveData(USART2);
+        if (rx != pat[i]) return 0u;                   /* 收到但对不上 */
+    }
+
+    return 1u;
+}
+
+static void usart2_pin_test(void)
+{
+    uint8_t  pa2_ok, pa3_ok, loop_ok;
+    uint32_t tx_lines = 0u;
+    uint32_t rx_bytes = 0u;
+    uint8_t  last_rx  = 0u;
+    uint16_t wait;
+    char     hex[] = "00";
+
+    USART_ITConfig(USART2, USART_IT_RXNE, DISABLE);    /* 测试期间自己轮询，不让中断抢数据 */
+
+    OLED_Clear();
+    OLED_ShowString(1, 1, "USART2 PIN TEST ");
+
+    /* 1) 电气自检 */
+    pa2_ok = pin_follows_pull(GPIOA, GPIO_Pin_2);
+    pa3_ok = pin_follows_pull(GPIOA, GPIO_Pin_3);
+    usart2_pins_restore();
+    Delay_ms(5);
+
+    OLED_ShowString(2, 1, "PA2:    PA3:    ");
+    OLED_ShowString(2, 5, pa2_ok ? "OK " : "BAD");
+    OLED_ShowString(2, 13, pa3_ok ? "OK " : "BAD");
+
+    /* 2) 自环测试（PA2 和 PA3 短接时才可能通过） */
+    loop_ok = usart2_loopback();
+    OLED_ShowString(3, 1, loop_ok ? "LOOP:OK         " : "LOOP:FAIL       ");
+
+    /* 串口也打一份，方便有调试线时看 */
+    USART3_SendString("\r\n[USART2 PIN TEST]\r\n");
+    USART3_Printf("  PA2 pull-up/down follow : %s\r\n", pa2_ok ? "OK" : "BAD");
+    USART3_Printf("  PA3 pull-up/down follow : %s\r\n", pa3_ok ? "OK" : "BAD");
+    USART3_Printf("  PA2->PA3 loopback       : %s\r\n", loop_ok ? "OK" : "FAIL");
+
+    /* LED 提示：通过 2 下，失败 5 下 */
+    {
+        uint8_t n = loop_ok ? 2u : 5u, i;
+        for (i = 0; i < n; i++)
+        {
+            GPIO_ResetBits(GPIOC, GPIO_Pin_13);
+            Delay_ms(120);
+            GPIO_SetBits(GPIOC, GPIO_Pin_13);
+            Delay_ms(120);
+        }
+    }
+
+    /* 3) 在线测试：持续发 + 收 */
+    OLED_ShowString(1, 1, "USART2 LIVE TEST");
+
+    while(1){
+        USART2_SendString("PA2TEST\r\n");
+        tx_lines++;
+
+        /* 500 ms 内不断轮询接收 */
+        for(wait = 0; wait < (PIN_LIVE_MS / 5u); wait++){
+            while(USART_GetFlagStatus(USART2, USART_FLAG_RXNE) == SET){
+                last_rx = (uint8_t)USART_ReceiveData(USART2);
+                rx_bytes++;
+            }
+            Delay_ms(5);
+        }
+
+        /* 第 4 行：TX 行数 / RX 字节数 / 最后一字节（十六进制） */
+        hex[0] = "0123456789ABCDEF"[(last_rx >> 4) & 0x0Fu];
+        hex[1] = "0123456789ABCDEF"[last_rx & 0x0Fu];
+
+        OLED_ShowString(4, 1, "TX:     RX:     ");
+        OLED_ShowNum(4, 4, tx_lines, oled_digits(tx_lines));
+        OLED_ShowNum(4, 11, rx_bytes, oled_digits(rx_bytes));
+        OLED_ShowString(4, 16, hex);      /* 最后一字节 */
+    }
+}
+
+
+/* ============================================================================
+ * 系统时钟自检
+ * ----------------------------------------------------------------------------
+ * 为什么需要它：Delay_us() 是按 HCLK 换算 SysTick 的。如果板上 8 MHz 的 HSE 晶振
+ * 没起振，芯片会退回 HSI 8 MHz，而 SystemCoreClock 变量仍然写着 72 MHz，
+ * 于是所有延时都慢 9 倍（500 ms 变成 4.5 s，LED 闪得特别慢就是它）。
+ * 这里直接读 RCC 寄存器算出真实的 SYSCLK、写回 SystemCoreClock，
+ * 再在 OLED / 串口上报告，方便区分"时钟不对"和"程序没跑/别的问题"。
+ * ========================================================================== */
+#define CLK_72MHZ   72000000u
+
+/* 读 RCC 寄存器算真实 SYSCLK（不信 SystemCoreClock 变量）：
+ *   SWS = 00 → HSI 8 MHz；01 → HSE 8 MHz；10 → PLL（HSI/2 或 HSE 再乘倍频） */
+static uint32_t clk_sysclk_hz(void)
+{
+    uint32_t cfgr = RCC->CFGR;
+    uint32_t mul, src;
+
+    switch(cfgr & RCC_CFGR_SWS){
+        case RCC_CFGR_SWS_HSI:
+            return HSI_VALUE;
+
+        case RCC_CFGR_SWS_HSE:
+            return HSE_VALUE;
+
+        case RCC_CFGR_SWS_PLL:
+            mul = (((cfgr & RCC_CFGR_PLLMULL) >> 18) + 2u);
+            if(mul > 16u) mul = 16u;                   /* 1111 也按 x16 算 */
+
+            if((cfgr & RCC_CFGR_PLLSRC) != 0u){        /* PLL 源 = HSE */
+                src = ((cfgr & RCC_CFGR_PLLXTPRE) != 0u) ? (HSE_VALUE / 2u) : HSE_VALUE;
+            }else{                                     /* PLL 源 = HSI/2 */
+                src = HSI_VALUE / 2u;
+            }
+            return src * mul;
+
+        default:
+            return 0u;
+    }
+}
+
+/* 用真实频率修正 SystemCoreClock：Delay_us() 按它换算，改完延时才是准的 */
+static void clk_fix(void)
+{
+    uint32_t hz = clk_sysclk_hz();
+
+    if(hz != 0u) SystemCoreClock = hz;
+}
+
+/* 把时钟情况报告到串口（只打串口，不画 OLED：
+ * OLED 没接/接错时绘图要等 I2C 超时，会把上电流程拖慢，这里不冒这个险） */
+static void clk_report(void)
+{
+    uint32_t hz   = SystemCoreClock;
+    uint32_t cfgr = RCC->CFGR;
+    const char *src = "???";
+
+    switch(cfgr & RCC_CFGR_SWS){
+        case RCC_CFGR_SWS_HSI: src = "HSI"; break;
+        case RCC_CFGR_SWS_HSE: src = "HSE"; break;
+        case RCC_CFGR_SWS_PLL: src = "PLL"; break;
+        default: break;
+    }
+
+    USART3_Printf("\r\n[CLK] SYSCLK=%u Hz (%u MHz) src=%s HSE_RDY=%u PLL_ON=%u\r\n",
+                  (unsigned)hz, (unsigned)(hz / 1000000u), src,
+                  (unsigned)((RCC->CR & RCC_CR_HSERDY) ? 1u : 0u),
+                  (unsigned)((RCC->CR & RCC_CR_PLLON) ? 1u : 0u));
+    USART3_Printf("[OLED] %s\r\n", OLED_IsReady() ? "OK" : "NOT FOUND - 绘图全部跳过");
+}
+
+/* ============================================================================
+ * 按钮自检：PC1 / PC2 / PC3 → PC13 / PC14 / PC15
+ * ----------------------------------------------------------------------------
+ * 对应关系（一个键管一个灯，按一次翻转一次）：
+ *     PC1  →  PC13
+ *     PC2  →  PC14
+ *     PC3  →  PC15
+ * 输入：PC1/PC2/PC3 上拉输入，按下接地（Key_GetNum() 不扫 PC，
+ *       这里单独初始化、直接读输入寄存器）。**PC0 没焊好，本版不用。**
+ * 输出：PC13/PC14/PC15 由 pc_out_high_init() 配成推挽输出，上电全高（灯灭）。
+ * 一次"按下"= 20 ms 消抖 + 等松手；同时按多个键时只处理编号最小的那个。
+ * OLED：第 1 行标题；第 2 行三个灯的电平；第 3 行最后按的键 + 累计次数；
+ *       第 4 行三路按键的实时电平（未按全 1，按下哪一路哪一位变 0）。
+ * 注 意：PC13/PC14/PC15 是低驱动能力引脚（≤3 mA、≤2 MHz、≤30 pF），只适合点灯/测量；
+ *        PC14/PC15 是 LSE 晶振脚，本工程没有开 LSE，所以可以当 GPIO 用。
+ * ========================================================================== */
+#define PC_KEY_COUNT    3u
+#define PC_KEY_PINS     (GPIO_Pin_1 | GPIO_Pin_2 | GPIO_Pin_3)   /* PC0 不焊，排除在外 */
+#define PC13_OUT_PIN    GPIO_Pin_13
+#define PC14_OUT_PIN    GPIO_Pin_14
+#define PC15_OUT_PIN    GPIO_Pin_15
+#define PC_KEY_NONE     0xFFu
+
+/* 键 → 灯 的映射表：下标 0 = PC1，1 = PC2，2 = PC3 */
+static const uint16_t k_pc_key_pin[PC_KEY_COUNT] = { GPIO_Pin_1, GPIO_Pin_2, GPIO_Pin_3 };
+static const uint16_t k_pc_led_pin[PC_KEY_COUNT] = { GPIO_Pin_13, GPIO_Pin_14, GPIO_Pin_15 };
+
+/* 【硬件自检】PC13/PC14/PC15 三脚直接输出高电平，放在 main() 最前面调用。
+ * 作用：只要程序跑起来，这三个脚立刻是高电平，可以用万用表/示波器直接量到，
+ *       用来区分"程序没跑"和"程序跑了但按键没接对"。
+ * 注 意：PC13/PC14/PC15 是低驱动能力引脚（≤3 mA、≤2 MHz、≤30 pF），
+ *        按数据手册同一时刻只建议用一个当输出，这里为了自检三个一起置高；
+ *        PC14/PC15 是 LSE 晶振脚，本工程没有开 LSE，所以可以当 GPIO 用。 */
+static void pc_out_high_init(void)
+{
+    GPIO_InitTypeDef gpio;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+    gpio.GPIO_Pin   = GPIO_Pin_13 | GPIO_Pin_14 | GPIO_Pin_15;
+    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_2MHz;                  /* 这三脚最高 2 MHz */
+    GPIO_Init(GPIOC, &gpio);
+
+    GPIO_SetBits(GPIOC, GPIO_Pin_13 | GPIO_Pin_14 | GPIO_Pin_15);
+}
+
+/* PC1~PC3 配成上拉输入（PC13/14/15 的推挽输出由 pc_out_high_init() 配，这里不重复配） */
+static void pc_key_init(void)
+{
+    GPIO_InitTypeDef gpio;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+    gpio.GPIO_Pin   = PC_KEY_PINS;
+    gpio.GPIO_Mode  = GPIO_Mode_IPU;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOC, &gpio);
+}
+
+/* 某个输出脚当前电平：1 = 高，0 = 低 */
+static uint8_t pc_out_level(uint16_t pin)
+{
+    return (GPIO_ReadOutputDataBit(GPIOC, pin) == Bit_RESET) ? 0u : 1u;
+}
+
+/* 翻转任意 GPIO 输出脚：先读输出寄存器再写，保证和当前电平相反 */
+static void gpio_pin_toggle(GPIO_TypeDef *port, uint16_t pin)
+{
+    if(GPIO_ReadOutputDataBit(port, pin) == Bit_RESET){
+        GPIO_SetBits(port, pin);      /* 低 → 高 */
+    }else{
+        GPIO_ResetBits(port, pin);    /* 高 → 低 */
+    }
+}
+
+/* 第 4 行：三路按键的实时电平（未按全 1，按下哪一路哪一位变 0）。
+ * 内部缓存，电平没变就不重画，避免 OLED 一直被刷。 */
+static void pc_key_show_input(void)
+{
+    static uint8_t shown = 0xFFu;                 /* 0xFF = 还没画过 */
+    uint16_t v = (uint16_t)(GPIO_ReadInputData(GPIOC) & PC_KEY_PINS);
+    uint8_t  bits = 0u, i;
+
+    for(i = 0; i < PC_KEY_COUNT; i++){
+        if((v & k_pc_key_pin[i]) != 0u) bits |= (uint8_t)(1u << i);
+    }
+
+    if(bits == shown) return;
+    shown = bits;
+
+    OLED_ShowString(4, 1, "P1=");
+    OLED_ShowNum(4, 4, (uint32_t)((bits >> 0) & 1u), 1);
+    OLED_ShowString(4, 6, "P2=");
+    OLED_ShowNum(4, 9, (uint32_t)((bits >> 1) & 1u), 1);
+    OLED_ShowString(4, 11, "P3=");
+    OLED_ShowNum(4, 14, (uint32_t)((bits >> 2) & 1u), 1);
+}
+
+/* 当前按着的键号：0 = PC1，1 = PC2，2 = PC3；没按返回 PC_KEY_NONE。
+ * 上拉输入 → 对应位为 0 就是按下；同时按下多个时返回编号最小的那个。 */
+static uint8_t pc_key_down(void)
+{
+    uint16_t v = (uint16_t)(GPIO_ReadInputData(GPIOC) & PC_KEY_PINS);
+    uint8_t  i;
+
+    for(i = 0; i < PC_KEY_COUNT; i++){
+        if((v & k_pc_key_pin[i]) == 0u) return i;
+    }
+
+    return PC_KEY_NONE;
+}
+
+/* 画界面：三个灯的电平、最后按的键、累计次数（只在翻转后调用，不闪屏） */
+static void pc_key_draw(uint32_t count, uint8_t last_key)
+{
+    OLED_ShowString(1, 1, "PC1-3 -> PC13-15");
+
+    /* 第 2 行：13:1 14:1 15:1 */
+    OLED_ShowString(2, 1, "                ");
+    OLED_ShowString(2, 1, "13:");
+    OLED_ShowNum(2, 4, pc_out_level(PC13_OUT_PIN), 1);
+    OLED_ShowString(2, 7, "14:");
+    OLED_ShowNum(2, 10, pc_out_level(PC14_OUT_PIN), 1);
+    OLED_ShowString(2, 13, "15:");
+    OLED_ShowNum(2, 16, pc_out_level(PC15_OUT_PIN), 1);
+
+    /* 第 3 行：K:2  CNT:5（K 显示的是 PC 编号 1~3） */
+    OLED_ShowString(3, 1, "                ");
+    OLED_ShowString(3, 1, "K:");
+    if(last_key != PC_KEY_NONE){
+        OLED_ShowNum(3, 3, (uint32_t)(last_key + 1u), 1);
+    }
+    OLED_ShowString(3, 6, "CNT:");
+    OLED_ShowNum(3, 10, count, oled_digits(count));
+}
+
+/* 按钮测试主循环：不返回。
+ *   PC1 按一次 → PC13 翻转一次
+ *   PC2 按一次 → PC14 翻转一次
+ *   PC3 按一次 → PC15 翻转一次 */
+static void pc_key_toggle_test(void)
+{
+    uint32_t count = 0u;
+    uint8_t  key;
+
+    pc_key_init();                /* PC1~PC3 上拉输入；PC13/14/15 已由 pc_out_high_init() 配好 */
+
+    OLED_Clear();
+    pc_key_draw(count, PC_KEY_NONE);
+    pc_key_show_input();
+    USART3_Printf("\r\nBUTTON TEST: PC1->PC13  PC2->PC14  PC3->PC15 (PC0 不用)\r\n");
+
+    while(1){
+        key = pc_key_down();
+        pc_key_show_input();      /* 第 4 行跟一下输入电平，按下就能看到哪一位变 0 */
+
+        if(key == PC_KEY_NONE){
             Delay_ms(5);
             continue;
         }
 
-        USART3_SendString("[RUN] START\r\n");
-        step = 0u;
-        ok   = 1u;
+        /* 消抖：20 ms 后还按着才算一次 */
+        Delay_ms(20);
+        key = pc_key_down();
+        if(key == PC_KEY_NONE) continue;
 
-        for(i = 0; i < GRAB_STEP_COUNT; i++){
-            step = (uint8_t)(i + 1u);
+        /* 等松手，避免按住不放连着翻 */
+        while(pc_key_down() != PC_KEY_NONE) Delay_ms(10);
+        Delay_ms(20);
 
-            Servo_SetAngle(k_grab_steps[i].id, k_grab_steps[i].deg);
-            grab_show(step, GRAB_BUSY);
-            USART3_Printf("[S%u] %s -> %u deg\r\n",
-                          (unsigned)step, k_grab_steps[i].label,
-                          (unsigned)k_grab_steps[i].deg);
+        gpio_pin_toggle(GPIOC, k_pc_led_pin[key]);   /* PC1→PC13 / PC2→PC14 / PC3→PC15 */
+        count++;
 
-            if(!grab_wait(GRAB_SETTLE_MS)){
-                ok = 0u;                 /* PA11 中止：停在当前姿势 */
-                break;
-            }
+        pc_key_show_input();      /* 松手后第 4 行恢复 */
+        pc_key_draw(count, key);
+        USART3_Printf("[PC%u] -> PC%u = %u (cnt %u)\r\n",
+                      (unsigned)(key + 1u), (unsigned)(13u + key),
+                      (unsigned)pc_out_level(k_pc_led_pin[key]),
+                      (unsigned)count);
+    }
+}
+
+/* ============================================================================
+ * PC13 方波 + 串口自检
+ * ----------------------------------------------------------------------------
+ * PC13 配成推挽输出，每 PC13_HALF_MS 毫秒翻转一次（默认 200 ms = 2.5 Hz）。
+ * 同时每 1 秒从 USART3 打一行心跳（PB10 = TX，PB11 = RX，115200 8N1），
+ * 收到什么就原样回显，用来验证收、发两个方向都通。
+ *
+ * 循环里**不碰 OLED**：OLED 不在线时每次绘图都要等 I2C 超时，会把周期拖到几秒。
+ * PC13 是低驱动能力脚（≤3 mA、≤2 MHz），只适合点灯/测量。
+ * ========================================================================== */
+#define PC13_TEST_PIN   GPIO_Pin_13
+#define PC13_HALF_MS    200u     /* 每个电平持续多少毫秒（200 = 2.5 Hz，500 = 1 Hz） */
+
+/* PC13 当前电平：1 = 高（灯灭），0 = 低（灯亮） */
+static uint8_t pc13_bit(void)
+{
+    return (GPIO_ReadOutputDataBit(GPIOC, PC13_TEST_PIN) == Bit_RESET) ? 0u : 1u;
+}
+
+/* PC13 方波 + 串口自检主循环：不返回。 */
+static void pc13_uart_test(void)
+{
+    GPIO_InitTypeDef gpio;
+    char     line[32];
+    uint32_t edges = 0u;         /* 翻转次数 */
+    uint32_t secs  = 0u;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+
+    gpio.GPIO_Pin   = PC13_TEST_PIN;
+    gpio.GPIO_Mode  = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_2MHz;        /* 这三脚最高 2 MHz */
+    GPIO_Init(GPIOC, &gpio);
+
+    GPIO_ResetBits(GPIOC, PC13_TEST_PIN);     /* 从亮开始（灯低电平点亮） */
+
+    /* ---------- 串口自检：开机横幅 ---------- */
+    USART3_SendString("\r\n\r\n");
+    USART3_SendString("==============================\r\n");
+    USART3_SendString("     UART3 TEST 115200 8N1\r\n");
+    USART3_SendString("  PB10=TX -> USB-TTL 的 RX\r\n");
+    USART3_SendString("  PB11=RX <- USB-TTL 的 TX\r\n");
+    USART3_SendString("  GND 必须共地\r\n");
+    USART3_SendString("==============================\r\n");
+    USART3_Printf("SYSCLK = %u Hz (%u MHz)\r\n",
+                  (unsigned)SystemCoreClock, (unsigned)(SystemCoreClock / 1000000u));
+    USART3_Printf("OLED   = %s\r\n", OLED_IsReady() ? "OK" : "NOT FOUND");
+    USART3_Printf("PC13   = %u ms / level\r\n", (unsigned)PC13_HALF_MS);
+    USART3_SendString("ASCII: 0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ abcxyz\r\n");
+    USART3_SendString("每 1 s 一行 UART3 OK；收到字符回显 RX:\r\n");
+
+    while(1){
+        Delay_ms(PC13_HALF_MS);
+
+        gpio_pin_toggle(GPIOC, PC13_TEST_PIN);   /* 方波 */
+        edges++;
+
+        /* 5 次翻转 = 1 s：打一行心跳，确认串口一直在发 */
+        if((edges % 5u) == 0u){
+            secs++;
+            USART3_Printf("UART3 OK  #%u  SYSCLK=%u  PC13=%u\r\n",
+                          (unsigned)secs, (unsigned)SystemCoreClock,
+                          (unsigned)pc13_bit());
         }
 
-        grab_show(step, ok ? GRAB_DONE : GRAB_ABORT);
-        USART3_SendString(ok ? "[RUN] DONE\r\n" : "[RUN] ABORT BY PA11\r\n");
-
-        /* 收尾：等 PA8 松手。否则"一直按住 PA8"会在动作结束后立刻再跑一遍。 */
-        while(GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_8) == Bit_RESET) Delay_ms(10);
+        /* 收到一行就回显（验证 RX 方向；PB11 同时是按键 2，接了无线模块就别按） */
+        if(USART3_ReadLine(line, (uint8_t)sizeof(line))){
+            USART3_Printf("RX: %s\r\n", line);
+        }
     }
+}
+
+
+/* ============================================================================
+ * 视觉链路测试（主控 <-> K230）—— 本模式**不动任何电机和舵机**，只发命令、只看数据
+ * ----------------------------------------------------------------------------
+ * 主控发一行字符串命令，K230 回数据，主控把数据画在 OLED 上：
+ *   PB1 发 "circle"  → K230 找圆心，回 C<x>,<y>,<r>   → 显示 X / Y / R
+ *   PA7 发 "linear"  → K230 找直线，回 L<k>,<psi>     → 显示 k / psi
+ *   PA5 发 "stop"    → 让 K230 停止回发
+ * 按键是"按下为高"，用 grab_key_init() 配成下拉输入（和夹取模式一致）。
+ * 帧格式见 Serial.h；解析在 Serial.c 的 K230_ParseLine（在 USART2 中断里跑）。
+ *
+ * OLED（每行 ≤16 字符，每次都先铺 16 个空格再写字，所以数字变宽不会留残影）：
+ *   1 行  CIRCLE OK / LINEAR TMO / IDLE / CIRCLE WAIT
+ *   2 行  圆心模式 X:318 Y:242    直线模式 K+0.04 P+1.92   没找到 NG (not found)
+ *   3 行  N:<序号> NG:<次数>
+ *   4 行  PB1:CIR PA7:LIN
+ *
+ * 超时：1 s 没收到对应帧 → 第 1 行变 TMO。因为不动作，超时没有危险，
+ *       第 2 行保留最后一次的好数据，看 N/NG 两个计数就知道是不是在掉数据。
+ * ========================================================================== */
+#define VISION_IDLE        0u
+#define VISION_CIRCLE      1u
+#define VISION_LINEAR      2u
+#define VISION_QUIET_MAX   250u     /* 每个循环约 4 ms，250 × 4 ms ≈ 1 s */
+
+/* 整行写 16 个字符：先铺空格再写字，避免新旧数字宽度不同留下残影。
+ *
+ * ★ 为什么要缓存：
+ *   OLED_ShowChar 是"上半 8 字节一次 I2C 事务，下半 8 字节又一次事务"，
+ *   一旦事务多了就偶发失败 —— 表现就是"字只显示上半截"（下半那次没写进去）。
+ *   静态行（比如最后那行按键提示）本来就不用每帧重画，缓存后 I2C 流量能省掉九成。 */
+static char    vision_last[5][17];
+static uint8_t vision_last_valid = 0u;
+
+/* 清屏 / 强制整屏重画之前调用：让缓存失效，否则会以为"已经画过了"而不写 */
+static void vision_row_invalidate(void)
+{
+    vision_last_valid = 0u;
+}
+
+static void vision_row(uint8_t line, const char *text)
+{
+    char    buf[17];
+    uint8_t i;
+
+    if((line < 1u) || (line > 4u)) return;
+
+    for(i = 0u; i < 16u; i++) buf[i] = ' ';
+    buf[16] = '\0';
+    for(i = 0u; (i < 16u) && (text[i] != '\0'); i++) buf[i] = text[i];
+
+    if(vision_last_valid)
+    {
+        for(i = 0u; i <= 16u; i++)
+        {
+            if(vision_last[line][i] != buf[i]) break;
+        }
+        if(i > 16u) return;                    /* 和屏上一模一样，不用写 */
+    }
+
+    OLED_ShowString(line, 1, buf);
+
+    for(i = 0u; i <= 16u; i++) vision_last[line][i] = buf[i];
+    vision_last_valid = 1u;
+}
+
+/* 把 0.01 单位的整数变成 "+1.92" / "-0.04" */
+static void vision_fmt_2dp(char *out, int32_t v)
+{
+    int32_t a = (v < 0L) ? -v : v;
+
+    sprintf(out, "%c%d.%02d", (v < 0L) ? '-' : '+',
+            (int)(a / 100L), (int)(a % 100L));
+}
+
+static void vision_link_test(void)
+{
+    uint8_t  mode    = VISION_IDLE;
+    uint8_t  got_any = 0u;
+    uint8_t  last_ng = 0u;
+    uint32_t cseq = 0u, lseq = 0u, ngseq = 0u;
+    uint16_t quiet = 0u;
+    uint16_t tick  = 0u;
+    char     row[24];
+    char     kbuf[12], pbuf[12];
+
+    grab_key_init();                     /* PB1 / PA7 / PA5：下拉输入，按下为高 */
+
+    /* ---------- 开机先画一屏静态内容，专门用来验屏 ----------
+     * 如果这一屏也"只有上半截"，那就是驱动/接线的事，跟视觉数据无关；
+     * 这一屏正常、进了循环才坏，那就是刷新太频繁 / I2C 事务丢失。 */
+    OLED_Clear();
+    vision_row_invalidate();
+    vision_row(1u, "OLED SELF TEST");
+    vision_row(2u, "ABCDEFGHIJKLMNOP");
+    vision_row(3u, "1234567890+-,.:;");
+    vision_row(4u, "VISION v1");
+    Delay_ms(1200);
+
+    OLED_Clear();
+    vision_row_invalidate();
+    vision_row(1u, "VISION IDLE");
+    vision_row(2u, "PB1:CIRCLE");
+    vision_row(3u, "PA7:LINEAR");
+    vision_row(4u, "PA5:STOP");
+
+    USART3_SendString("\r\n[VISION] PB1=circle PA7=linear PA5=stop\r\n");
+
+    while(1)
+    {
+        uint8_t changed = 0u;
+
+        /* ---------- 按键：发命令 + 切模式 ---------- */
+        if(grab_step_hit())                                  /* PB1 */
+        {
+            K230_SendLine(K230_CMD_CIRCLE);
+            mode = VISION_CIRCLE;
+            cseq = K230_CircleSeq;
+            got_any = 0u; last_ng = 0u; quiet = 0u; changed = 1u;
+            USART3_SendString("[VISION] TX circle\r\n");
+        }
+        else if(grab_start_hit())                            /* PA7 */
+        {
+            K230_SendLine(K230_CMD_LINEAR);
+            mode = VISION_LINEAR;
+            lseq = K230_LineSeq;
+            got_any = 0u; last_ng = 0u; quiet = 0u; changed = 1u;
+            USART3_SendString("[VISION] TX linear\r\n");
+        }
+        else if(grab_abort_hit())                            /* PA5 */
+        {
+            K230_SendLine(K230_CMD_STOP);
+            mode = VISION_IDLE;
+            got_any = 0u; last_ng = 0u; quiet = 0u; changed = 1u;
+            USART3_SendString("[VISION] TX stop\r\n");
+        }
+
+        /* ---------- 来了新帧？（看序号变没变，天然不怕旧帧） ---------- */
+        if((mode == VISION_CIRCLE) && (K230_CircleSeq != cseq))
+        {
+            cseq = K230_CircleSeq; got_any = 1u; last_ng = 0u; quiet = 0u; changed = 1u;
+        }
+        if((mode == VISION_LINEAR) && (K230_LineSeq != lseq))
+        {
+            lseq = K230_LineSeq; got_any = 1u; last_ng = 0u; quiet = 0u; changed = 1u;
+        }
+        if(K230_NgSeq != ngseq)
+        {
+            ngseq = K230_NgSeq; got_any = 1u; last_ng = 1u; quiet = 0u; changed = 1u;
+        }
+
+        if(quiet < VISION_QUIET_MAX) quiet++;
+
+        /* 每约 2 秒：强制整屏重刷一次（防止偶发丢事务留下半个字），
+         * 同时把 OLED 的 I2C 失败次数打到调试串口 —— 这个数是排查的关键：
+         *   一直在涨  -> I2C 时序/接线问题（100 kHz 还涨就得查线和上拉）
+         *   一直是 0  -> 不是总线问题，看内容/坐标 */
+        if((tick % 500u) == 0u)
+        {
+            vision_row_invalidate();
+            USART3_Printf("[oled] i2c_err=%u\r\n", (unsigned)OLED_GetI2cErrors());
+        }
+
+        /* ---------- 每 500 ms（或状态刚变化）刷一次屏，内容没变的行不会真写 ---------- */
+        if(changed || ((tick % 125u) == 0u))
+        {
+            const char *label;
+            const char *state;
+
+            if(mode == VISION_CIRCLE)      label = "CIRCLE";
+            else if(mode == VISION_LINEAR) label = "LINEAR";
+            else                           label = "IDLE";
+
+            if(mode == VISION_IDLE)              state = "";
+            else if(!got_any)                    state = " WAIT";
+            else if(quiet >= VISION_QUIET_MAX)   state = " TMO";
+            else                                 state = " OK";
+
+            sprintf(row, "%s%s", label, state);
+            vision_row(1u, row);
+
+            if(mode == VISION_CIRCLE)
+            {
+                if(last_ng) vision_row(2u, "NG (not found)");
+                else
+                {
+                    sprintf(row, "X:%d Y:%d", (int)K230_Cx, (int)K230_Cy);
+                    vision_row(2u, row);
+                }
+                sprintf(row, "R:%d N:%u", (int)K230_R, (unsigned)K230_CircleSeq);
+                vision_row(3u, row);
+            }
+            else if(mode == VISION_LINEAR)
+            {
+                if(last_ng) vision_row(2u, "NG (not found)");
+                else
+                {
+                    vision_fmt_2dp(kbuf, (int32_t)K230_K100);
+                    vision_fmt_2dp(pbuf, (int32_t)K230_PsiCenti);
+                    sprintf(row, "K%s P%s", kbuf, pbuf);
+                    vision_row(2u, row);
+                }
+                sprintf(row, "N:%u NG:%u", (unsigned)K230_LineSeq, (unsigned)K230_NgSeq);
+                vision_row(3u, row);
+            }
+            else
+            {
+                vision_row(2u, "PB1:CIRCLE");
+                vision_row(3u, "PA7:LINEAR");
+            }
+
+            vision_row(4u, "PB1:CIR PA7:LIN");
+        }
+
+        tick++;
+        Delay_ms(4);
+    }
+}
+
+
+/* 上电用 PC13 闪几下报告 OLED 探测结果（OLED 不亮、串口也关了，就靠这个判断）：
+ *   1 下 = 面板有应答（I2C 通了，只是显示内容没刷出来 → 看对比度/地址）
+ *   3 下 = 面板没应答（接线 / 上拉 / 供电 / 模块坏）
+ */
+static void boot_oled_indicator(uint8_t oled_ok)
+{
+    uint8_t n = oled_ok ? 1u : 3u;
+    uint8_t i;
+
+    for(i = 0; i < n; i++){
+        GPIO_ResetBits(GPIOC, GPIO_Pin_13);   /* 亮（低电平点亮） */
+        Delay_ms(150);
+        GPIO_SetBits(GPIOC, GPIO_Pin_13);     /* 灭 */
+        Delay_ms(150);
+    }
+
+    Delay_ms(500);
 }
 
 
@@ -1879,34 +3214,41 @@ int main(void)
     u8 step = 0;
 	
 	s32 yaw_centi_degrees = 0, last_yaw_centi_degrees = 0;
+
+    /* 【第 0 步】先把 SystemCoreClock 修正成芯片的真实频率（读 RCC 寄存器推算）。
+     * HSE 晶振没起振时芯片跑 HSI 8 MHz，而默认变量还写着 72 MHz，
+     * 不修正的话后面所有 Delay_ms 都会慢 9 倍。 */
+    clk_fix();
+
+    /* 【第 1 步】PC13/PC14/PC15 直接输出高电平：只要程序跑起来，这三个脚立刻是高 */
+    pc_out_high_init();
+
     LED_Init();
-    Servo_Init();             /* PC7/PC8/PC9 三路舵机 PWM，上电输出安全角度 240/90/65 */
-    OLED_Init();
-    Key_Init();
-    Serial_Init();
+    Servo_Init();             /* PA1(旋转)/PA0(夹爪) 两路舵机 PWM，上电输出 30°/85°（PA2 弃用） */
+    OLED_Init();              /* 硬件 I2C1：PB6=SCL / PB7=SDA；探测不到就不画 */
+    boot_oled_indicator(OLED_IsReady());   /* 闪 1 下 = OLED 应答，3 下 = 没应答 */
+    Key_Init();               /* 按键 PB1 / PA7 / PA5（下拉输入，按下为高） */
+    Serial_Init();            /* USART1：电机总线（也是串口烧录口） */
     Gyro_Init();
-    USART3_Init(115200);
-    USART2_Init(115200);
+    USART3_Init(115200);      /* 调试串口：PB10=TX / PB11=RX，115200 8N1 */
+    USART2_Init(115200);      /* 陀螺仪 / K230：只收（PA3），PA2 已弃用 */
 	
 	
-	uint32_t oled_frame_us;
-
-	/* 硬件 I2C1 效率测试：整屏 1024 字节刷新耗时，结果显示在 OLED 3、4 行，
-	 * 同时从 USART3 打印一份，方便终端查看。测试会清屏，需放在其它绘图之前。 */
-	oled_frame_us = OLED_ShowI2CStats();
-	USART3_Printf("OLED HW I2C: frame=%dus, %dKB/s, util=%d%%\r\n",
-	              (int)oled_frame_us,
-	              (int)(1000000u / (oled_frame_us ? oled_frame_us : 1u)),
-	              (int)(2304000u / (oled_frame_us ? oled_frame_us : 1u)));
-
 	/* 电机上电默认失能（F3 使能帧之前所有运动指令都会被忽略），
 	 * 任何会驱动底盘的模式都必须先使能，否则车一动不动。 */
 	motor_enable_all();
 
-	/* 夹取物料调试动作：PA8 启动整套动作，PA11 中途中止，OLED 显示当前步骤和三个舵机角度。
-	 * 这是临时测试，排在调试模式派发之前，所以下面的 DEBUG_MODE 分支暂时都走不到；
-	 * 想回去测物料电机 / 单个舵机就换成 material_calib_test() / servo270_test()。 */
-	grab_run_once();
+	/* 时钟情况 + OLED 是否在线，都只打串口：
+	 * SYSCLK 显示 HSI/8 MHz、HSE_RDY=0 就是晶振没起振（延时慢 9 倍的原因）。 */
+	clk_report();
+
+	/* ===== USART2 引脚自检（PA2=TX / PA3=RX 是不是好的）=====
+	 *  1) 电气：PA2/PA3 上拉/下拉是否跟随 → OLED 第 2 行
+	 *  2) 自环：把 PA2 和 PA3 用杜邦线短接，通过则第 3 行 LOOP:OK，PC13 闪 2 下
+	 *  3) 在线：每 0.5 s 往 PA2 发一行 "PA2TEST"，同时统计 PA3 收到的字节
+	 * 注意：它是**死循环**，一旦调用就进不了下面的调试模式。
+	 * 已经实测确认 PA2/PA3 都正常，所以默认注释掉；要复测再打开这一行。 */
+	// usart2_pin_test();
 
 	/* 调试模式派发：各模式函数内部都是死循环，正常情况下不会返回。
 	 * 切换模式改文件上方的 DEBUG_MODE 即可。 */
@@ -1922,6 +3264,8 @@ int main(void)
 	chassis_check_test();       /* 速度模式底盘自检：前进/平移/旋转/标定 */
 #elif DEBUG_MODE == DEBUG_MODE_WIRELESS
 	wireless_test_run();        /* 无线串口底盘测试：USART3 + tools/chassis_host.py */
+#elif DEBUG_MODE == DEBUG_MODE_VISION
+	vision_link_test();         /* 视觉链路：发 circle/linear，OLED 显示 K230 回的数据 */
 #else
 	servo_angle_test();         /* 舵机角度按键标定 */
 #endif

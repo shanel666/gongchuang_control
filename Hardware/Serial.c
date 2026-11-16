@@ -242,15 +242,21 @@ void USART2_Init(uint32_t bound)
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
 
+    /* 注意：PA2 原来是 USART2_TX，中间让给过舵机；现在舵机在 PA0/PA1，
+     * PA2 空出来了，这里恢复成"发送"——主控要靠它给 K230 发任务码。
+     * ★ 你之前怀疑 PA2 这个脚损坏：发任务码如果 K230 收不到，先量 PA2 有没有波形，
+     *   确认后可以把 K230 改接到 USART3(PB10/PB11) 上（见 SERIAL_USART3_ENABLE）。 */
+
     /* PA2 - USART2_TX 复用推挽输出 */
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    /* PA3 - USART2_RX 浮空输入（或上拉输入） */
+    /* PA3 - USART2_RX 上拉输入（K230 的 TX / 陀螺仪的 TX 接这里） */
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
-    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IN_FLOATING;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
     /* USART2 参数配置 */
@@ -259,7 +265,7 @@ void USART2_Init(uint32_t bound)
     USART_InitStructure.USART_StopBits = USART_StopBits_1;
     USART_InitStructure.USART_Parity = USART_Parity_No;
     USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
-    USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
+    USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;   /* 收 K230 数据 + 发任务码 */
     USART_Init(USART2, &USART_InitStructure);
 
     /* 开启 USART2 接收中断 */
@@ -281,70 +287,215 @@ void USART2_SendByte(uint8_t byte)
     USART_SendData(USART2, byte);
     while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);
 }
-/* ---------------- K230 圆心数据：ASCII "320,240\r\n" ----------------
- * 和陀螺仪二进制帧共用 USART2 接收中断：这里只接受数字、逗号和空格，
- * 其它字节（陀螺仪帧头 0x55 等）直接丢弃当前行，避免把二进制当文本解析。
- * 一行收完后统一校验：必须是 "数字,数字"，最多 4 位，范围 0~999，
- * 校验不过整行丢弃，不覆盖上一帧有效数据。 */
+/* ============================================================================
+ * K230 文本帧解析（USART2 RX = PA3，ASCII，一行一帧，'\r' 或 '\n' 结尾）
+ * ----------------------------------------------------------------------------
+ * 【下行】主控 -> K230（USART2 TX = PA2，K230_SendLine() 发，自动补 \r\n）
+ *      circle      开始找圆心，K230 持续回 C 帧
+ *      linear      开始找直线，K230 持续回 L 帧
+ *      stop        停止回发
+ *
+ * 【上行】K230 -> 主控，三种帧：
+ *      C<x>,<y>,<r>      找圆心结果        例：C318,242,41
+ *                        x,y = 圆心像素坐标（0~999），r = 半径像素
+ *      L<k>,<psi>        直线结果          例：L4,192   L-12,-345
+ *                        k   = 斜率 ×100（整数，4 就是 0.04）
+ *                        psi = 需要的偏航修正角，单位 0.01°，
+ *                              正 = 顺时针转（shun_yaw_ / dir=0x00）
+ *                              负 = 逆时针转（ni_yaw_   / dir=0x01）
+ *      NG                这次没找到（圆不够 / 斜率超门限）
+ *
+ *      另外保留旧格式 "<x>,<y>"（老的 find_circle 脚本还在用）。
+ *
+ * 规则：
+ *   · 一行最多 15 字节，超长整行丢弃重新同步；
+ *   · 白名单字符 = 数字 / 字母 / 逗号 / '+' / '-' / 空格，
+ *     其它字节（比如陀螺仪的 0x55 帧头）一律丢掉整行；
+ *   · 格式或范围不对整行丢弃，只让 K230_BadLine 自增，**不覆盖上一帧好数据**；
+ *   · 每种帧有自己的序号（CircleSeq / LineSeq / NgSeq），主循环靠"序号变了"
+ *     判断来了新数据，天然不怕旧帧。
+ * ========================================================================== */
 #define K230_LINE_MAX   16u
 
+/* 旧格式（find_circle 老脚本）：圆心 */
 volatile uint16_t K230_CircleX = 0;
 volatile uint16_t K230_CircleY = 0;
 volatile uint32_t K230_FrameCount = 0;
 
+/* C 帧：找圆心结果 */
+volatile int16_t  K230_Cx = 0;
+volatile int16_t  K230_Cy = 0;
+volatile int16_t  K230_R  = 0;
+volatile uint32_t K230_CircleSeq = 0;
+
+/* L 帧：直线结果 */
+volatile int16_t  K230_K100 = 0;        /* 斜率 ×100 */
+volatile int16_t  K230_PsiCenti = 0;    /* 偏航修正角，0.01° */
+volatile uint32_t K230_LineSeq = 0;
+
+/* NG 帧次数 / 丢弃的行数（调试用：只涨不跌说明格式对不上） */
+volatile uint32_t K230_NgSeq = 0;
+volatile uint32_t K230_BadLine = 0;
+
 static char    k230_line[K230_LINE_MAX];
 static uint8_t k230_len = 0;
 
-/* 解析一行 "x,y"；格式/范围不对就返回，不更新数据。 */
-static void K230_LineCommit(void)
+/* ==== TEST-BLOCK-BEGIN：纯逻辑，主机上可以单独抽出来编译测试 ==== */
+
+static const char *k230_p = 0;          /* 解析游标 */
+
+static void k230_skip_space(void)
 {
-    uint8_t  i = 0;
-    uint8_t  nd = 0;
-    uint16_t x = 0, y = 0;
-
-    while (i < k230_len && k230_line[i] == ' ') i++;
-
-    while (i < k230_len && k230_line[i] >= '0' && k230_line[i] <= '9')
-    {
-        x = (uint16_t)(x * 10u + (uint16_t)(k230_line[i] - '0'));
-        if (++nd > 4u) return;                          /* 数字位过多 */
-        i++;
-    }
-    if (nd == 0u) return;                               /* 没有 x 数值 */
-
-    while (i < k230_len && k230_line[i] == ' ') i++;
-    if (i >= k230_len || k230_line[i] != ',') return;   /* 缺逗号 */
-    i++;
-
-    while (i < k230_len && k230_line[i] == ' ') i++;
-    nd = 0u;
-    while (i < k230_len && k230_line[i] >= '0' && k230_line[i] <= '9')
-    {
-        y = (uint16_t)(y * 10u + (uint16_t)(k230_line[i] - '0'));
-        if (++nd > 4u) return;
-        i++;
-    }
-    if (nd == 0u) return;                               /* 没有 y 数值 */
-
-    while (i < k230_len && k230_line[i] == ' ') i++;
-    if (i != k230_len) return;                          /* 行尾还有多余字符 */
-
-    if (x > 999u || y > 999u) return;                   /* 超出图像范围，按噪声丢弃 */
-
-    K230_CircleX = x;
-    K230_CircleY = y;
-    K230_FrameCount++;                                  /* 每帧有效数据自增，供主循环判"新帧" */
+    while (*k230_p == ' ') k230_p++;
 }
 
-/* 逐字节喂给行缓冲；只收合法文本字符，遇 \r/\n 结束一行。 */
+/* 读一个十进制整数（可带 +/-）。成功 1，失败 0。 */
+static uint8_t k230_parse_int(int32_t *out)
+{
+    int32_t v = 0;
+    uint8_t neg = 0u;
+    uint8_t nd  = 0u;
+
+    k230_skip_space();
+    if (*k230_p == '-')      { neg = 1u; k230_p++; }
+    else if (*k230_p == '+') { k230_p++; }
+
+    while (*k230_p >= '0' && *k230_p <= '9')
+    {
+        v = v * 10 + (int32_t)(*k230_p - '0');
+        k230_p++;
+        if (++nd > 5u) return 0u;       /* 位数过多 */
+    }
+    if (nd == 0u) return 0u;            /* 一个数字都没有 */
+
+    *out = neg ? -v : v;
+    return 1u;
+}
+
+/* 期待一个分隔符（允许夹空格） */
+static uint8_t k230_expect(char c)
+{
+    k230_skip_space();
+    if (*k230_p != c) return 0u;
+    k230_p++;
+    return 1u;
+}
+
+static uint8_t k230_at_end(void)
+{
+    k230_skip_space();
+    return (*k230_p == '\0') ? 1u : 0u;
+}
+
+/* 解析一整行（不含 \r\n）。返回 1 = 认出一帧有效数据；0 = 丢弃。
+ * 这个函数只碰变量，不碰任何硬件寄存器，所以能在电脑上直接跑断言。 */
+uint8_t K230_ParseLine(const char *line, uint8_t len)
+{
+    char    c;
+    int32_t a, b, d;
+
+    if ((line == 0) || (len == 0u)) return 0u;
+
+    k230_p = line;
+    k230_skip_space();
+
+    c = *k230_p;
+    if ((c >= 'a') && (c <= 'z')) c = (char)(c - 'a' + 'A');   /* 小写也认 */
+
+    if (c == 'C')                                   /* C<x>,<y>,<r> */
+    {
+        k230_p++;
+        if (!k230_parse_int(&a)) goto bad;
+        if (!k230_expect(','))   goto bad;
+        if (!k230_parse_int(&b)) goto bad;
+        if (!k230_expect(','))   goto bad;
+        if (!k230_parse_int(&d)) goto bad;
+        if (!k230_at_end())      goto bad;
+        if ((a < 0) || (a > 999) || (b < 0) || (b > 999) ||
+            (d < 0) || (d > 999))
+            goto bad;
+
+        K230_Cx = (int16_t)a;
+        K230_Cy = (int16_t)b;
+        K230_R  = (int16_t)d;
+        K230_CircleSeq++;
+        return 1u;
+    }
+
+    if (c == 'L')                                   /* L<k>,<psi> */
+    {
+        k230_p++;
+        if (!k230_parse_int(&a)) goto bad;
+        if (!k230_expect(','))   goto bad;
+        if (!k230_parse_int(&b)) goto bad;
+        if (!k230_at_end())      goto bad;
+        if ((a < -9999) || (a > 9999) ||
+            (b < -18000) || (b > 18000))
+            goto bad;
+
+        K230_K100     = (int16_t)a;
+        K230_PsiCenti = (int16_t)b;
+        K230_LineSeq++;
+        return 1u;
+    }
+
+    if (c == 'N')                                   /* NG */
+    {
+        k230_p++;
+        c = *k230_p;
+        if ((c >= 'a') && (c <= 'z')) c = (char)(c - 'a' + 'A');
+        if (c == 'G')
+        {
+            k230_p++;
+            if (k230_at_end())
+            {
+                K230_NgSeq++;
+                return 1u;
+            }
+        }
+        goto bad;
+    }
+
+    if ((c >= '0') && (c <= '9'))                   /* 旧格式 x,y */
+    {
+        if (!k230_parse_int(&a)) goto bad;
+        if (!k230_expect(','))   goto bad;
+        if (!k230_parse_int(&b)) goto bad;
+        if (!k230_at_end())      goto bad;
+        if ((a < 0) || (a > 999) || (b < 0) || (b > 999)) goto bad;
+
+        K230_CircleX = (uint16_t)a;
+        K230_CircleY = (uint16_t)b;
+        K230_FrameCount++;
+        return 1u;
+    }
+
+bad:
+    K230_BadLine++;
+    return 0u;
+}
+
+/* ==== TEST-BLOCK-END ==== */
+
+/* 一行收完：交给解析器。失败只是丢这一行，已存的好数据不动。 */
+static void K230_LineCommit(void)
+{
+    k230_line[k230_len] = '\0';
+    (void)K230_ParseLine(k230_line, k230_len);
+}
+
+/* 逐字节喂行缓冲；只收合法文本字符，遇 \r/\n 结束一行。 */
 static void K230_FeedByte(uint8_t ch)
 {
-    if (ch == '\r' || ch == '\n')
+    if ((ch == '\r') || (ch == '\n'))
     {
         if (k230_len != 0u) K230_LineCommit();
         k230_len = 0u;
     }
-    else if ((ch >= '0' && ch <= '9') || ch == ',' || ch == ' ')
+    else if (((ch >= '0') && (ch <= '9')) ||
+             ((ch >= 'A') && (ch <= 'Z')) ||
+             ((ch >= 'a') && (ch <= 'z')) ||
+             (ch == ',') || (ch == '-') || (ch == '+') || (ch == ' '))
     {
         if (k230_len < (K230_LINE_MAX - 1u)) k230_line[k230_len++] = (char)ch;
         else k230_len = 0u;                             /* 超长，丢弃整行重新同步 */
@@ -462,6 +613,27 @@ void USART2_SendInt(int32_t v)
     USART2_SendDec((uint32_t)v);
 }
 
+/* ============================================================================
+ * 主控 -> K230：命令字（ASCII 文本行，走 USART2 TX = PA2，115200 8N1）
+ * ----------------------------------------------------------------------------
+ * 用文本而不是二进制，是为了 K230 那边用 Python 直接 readline() 解析，
+ * 调试时也能在串口终端上一眼看出收到了什么。
+ *
+ * 现在只有三条（K230 那边收到什么就切什么模式）：
+ *   circle   开始找圆心，K230 持续回 C<x>,<y>,<r>
+ *   linear   开始找直线，K230 持续回 L<k>,<psi>
+ *   stop     停止回发
+ * 回帧格式和字段含义见本文件上方"K230 文本帧解析"那段注释。
+ * ========================================================================== */
+
+/* 发一整行自定义文本（结尾自动补 \r\n） */
+void K230_SendLine(const char *s)
+{
+    while (*s != '\0') USART2_SendByte((uint8_t)*s++);
+    USART2_SendByte('\r');
+    USART2_SendByte('\n');
+}
+
 /* ---------------- USART3：无线串口（上位机 115200） ----------------
  * 默认映射 PB10(TX) / PB11(RX)。发送用于调试文本，接收按"一行一条命令"
  * 处理：\r 或 \n 结尾。中断里用双缓冲，主循环拿走 ready 缓冲区时中断写
@@ -477,28 +649,68 @@ static volatile uint8_t usart3_rx_ready_idx = 0;   /* 已收完、等主循环�
 static volatile uint8_t usart3_rx_ready = 0;
 static volatile uint8_t usart3_rx_len = 0;
 
-/* USART3：默认映射，TX=PB10，RX=PB11，全双工 */
+/* USART3 开关（默认映射 TX=PB10 / RX=PB11；也可以完全重映射到 PC10/PC11）
+ *
+ *   0 = 关闭（当前）：PB10/PB11 接 OLED 的 SDA/SCL（见 OLED.c），
+ *       USART3_Init() 什么都不做，USART3_SendXxx / ReadLine 全变空操作，
+ *       主程序里原有的打印语句不用删，也不影响 OLED。
+ *
+ *   1 = 用默认引脚 PB10(TX) / PB11(RX) —— 此时 OLED 不能接在这两个脚上。
+ *
+ *   2 = USART3 完全重映射 → PC10(TX) / PC11(RX)，★推荐★
+ *       OLED 继续用 PB10/PB11，互不冲突，等于白捡一路完整串口。
+ *       PC10/PC11 在本工程里没有别的用途（PC13/14/15 是板载 LED）。
+ *       接线：PC10 → USB-TTL 的 RX，PC11 ← USB-TTL 的 TX，GND 共地。 */
+#define SERIAL_USART3_ENABLE   1
+
+#if   SERIAL_USART3_ENABLE == 1
+  #define U3_TX_PORT   GPIOB
+  #define U3_TX_PIN    GPIO_Pin_10
+  #define U3_RX_PORT   GPIOB
+  #define U3_RX_PIN    GPIO_Pin_11
+  #define U3_TX_CLK    RCC_APB2Periph_GPIOB
+  #define U3_RX_CLK    RCC_APB2Periph_GPIOB
+#elif SERIAL_USART3_ENABLE == 2
+  #define U3_TX_PORT   GPIOC
+  #define U3_TX_PIN    GPIO_Pin_10
+  #define U3_RX_PORT   GPIOC
+  #define U3_RX_PIN    GPIO_Pin_11
+  #define U3_TX_CLK    RCC_APB2Periph_GPIOC
+  #define U3_RX_CLK    RCC_APB2Periph_GPIOC
+#endif
+
+#if SERIAL_USART3_ENABLE != 0
+
 void USART3_Init(uint32_t bound)
 {
     GPIO_InitTypeDef GPIO_InitStructure;
     USART_InitTypeDef USART_InitStructure;
     NVIC_InitTypeDef NVIC_InitStructure;
 
-    /* 使能 GPIOB 和 USART3 时钟（不需要 AFIO 时钟） */
-    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+    /* 使能 GPIO 时钟（模式 2 还要 AFIO 时钟做重映射） */
+    RCC_APB2PeriphClockCmd(U3_TX_CLK | U3_RX_CLK
+#if SERIAL_USART3_ENABLE == 2
+                           | RCC_APB2Periph_AFIO
+#endif
+                           , ENABLE);
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART3, ENABLE);
 
-    /* USART3 TX -> PB10 */
-    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10;
+#if SERIAL_USART3_ENABLE == 2
+    /* USART3 完全重映射：TX -> PC10，RX -> PC11 */
+    GPIO_PinRemapConfig(GPIO_FullRemap_USART3, ENABLE);
+#endif
+
+    /* TX：复用推挽 */
+    GPIO_InitStructure.GPIO_Pin = U3_TX_PIN;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(GPIOB, &GPIO_InitStructure);
+    GPIO_Init(U3_TX_PORT, &GPIO_InitStructure);
 
-    /* USART3 RX -> PB11（上拉输入，空闲为高；无线模块的 TX 接这里） */
-    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_11;
+    /* RX：上拉输入，空闲为高（对端模块的 TX 接这里） */
+    GPIO_InitStructure.GPIO_Pin = U3_RX_PIN;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(GPIOB, &GPIO_InitStructure);
+    GPIO_Init(U3_RX_PORT, &GPIO_InitStructure);
 
     USART_InitStructure.USART_BaudRate = bound;
     USART_InitStructure.USART_WordLength = USART_WordLength_8b;
@@ -519,6 +731,15 @@ void USART3_Init(uint32_t bound)
 
     USART_Cmd(USART3, ENABLE);
 }
+
+#else   /* SERIAL_USART3_ENABLE == 0：PB10/PB11 让给 OLED，串口全部变空操作 */
+
+void USART3_Init(uint32_t bound)
+{
+    (void)bound;      /* 不配置 PB10/PB11，把这两个脚完整留给 OLED 的 I2C */
+}
+
+#endif  /* SERIAL_USART3_ENABLE */
 
 /* 取走一行命令（不含 \r\n），有整行返回 1；没有返回 0。
  * 复制期间关 RXNE 中断，避免中断正好把同一缓冲区换回来写。 */
@@ -585,8 +806,13 @@ void USART3_IRQHandler(void)
 
 void USART3_SendByte(uint8_t byte)
 {
+#if SERIAL_USART3_ENABLE
     USART_SendData(USART3, byte);
     while (USART_GetFlagStatus(USART3, USART_FLAG_TXE) == RESET);
+#else
+    /* 串口已关闭（PB10/PB11 给了 OLED）：直接返回，避免等一个永远不会置位的 TXE */
+    (void)byte;
+#endif
 }
 
 static void USART3_SendUnsigned(uint32_t value)

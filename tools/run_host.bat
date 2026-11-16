@@ -1,5 +1,5 @@
 @echo off
-rem åŒå‡»è¿è¡Œæ— çº¿ä¸²å£ä¸Šä½æœºï¼ˆéœ€è¦ Python 3 + pyserialï¼‰
+rem Ë«»÷ÔËĞĞÎŞÏß´®¿ÚÉÏÎ»»ú£¨ĞèÒª Python 3 + pyserial£©
 cd /d "%~dp0"
 python chassis_host.py
 if errorlevel 1 pause

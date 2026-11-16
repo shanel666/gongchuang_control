@@ -3,83 +3,78 @@
 #include "OLED.h"
 /*
  * 硬件 I2C1 驱动 SSD1306
- *   PB6 = I2C1_SCL（默认映射，无需重映射）
- *   PB7 = I2C1_SDA
- *   速率 400 kHz（快速模式），SSD1306 支持
  *
- * 相比原来的软件 I2C（逐位翻转 GPIO），这里：
- *   1. 由 I2C 外设产生时序，CPU 只等事件标志；
- *   2. 一条命令/一段显存数据只用一次 START/STOP，刷新时把整页 128 字节
- *      一次性发出去，而不是每个字节都 START/STOP。
+ * 引脚（芯片内部固定，不能自己指定）：
+ *   PB6 = I2C1_SCL
+ *   PB7 = I2C1_SDA
+ * 也就是 **SCL 接 PB6、SDA 接 PB7**，默认映射，不需要重映射。
+ *
+ * 为什么用 I2C1 而不是 I2C2：
+ *   PB10/PB11 是 I2C2 的脚，但这两个脚要还给 USART3（调试/无线串口）；
+ *   I2C1 的默认脚就是 PB6/PB7，本工程里没有别的用途，正好给 OLED。
+ *   （LQFP48 封装没有 PC10/PC11，所以 USART3 没法重映射出别的脚。）
+ *
+ * 速率 400 kHz；线接得长/不稳定时把 OLED_I2C_SPEED 降到 100000。
  */
 
 #define OLED_I2C            I2C1
 #define OLED_I2C_CLK        RCC_APB1Periph_I2C1
 #define OLED_SLAVE_ADDR     0x78		/* SSD1306 从机地址 0111 1000 */
-#define OLED_I2C_SPEED      400000u		/* 400 kHz；不稳定时可降到 100000 */
+#define OLED_I2C_SPEED      100000u		/* 100 kHz。
+										 * 原来是 400 kHz，但 vision 模式每 100 ms 整屏刷 4 行
+										 * （约 10 KB/s）时，400 kHz 下偶发 I2C 事务超时，
+										 * 表现是"每个字只显示上半截"——因为 OLED_ShowChar
+										 * 是"上半 8 字节一次事务、下半 8 字节又一次事务"，
+										 * 下半那次失败就只剩上半截。
+										 * 100 kHz 只是慢一点，刷新率本来就不高，够用。 */
 
-#define OLED_SCL_PIN        GPIO_Pin_6
-#define OLED_SDA_PIN        GPIO_Pin_7
+#define OLED_SCL_PIN        GPIO_Pin_6	/* PB6 = I2C1_SCL */
+#define OLED_SDA_PIN        GPIO_Pin_7	/* PB7 = I2C1_SDA */
 
-/* 耗时测量用的定时器：TIM2 自由运行，1 个计数 = 1 us。
- * TIM3 已用于舵机 PWM，TIM2 在本工程中未被占用。
- * F103 的 TIM2 是 32 位计数器，ARR 拉满后约 71 分钟才回绕。 */
-#define OLED_TIM            TIM2
-#define OLED_TIM_CLK        RCC_APB1Periph_TIM2
+/* 注意：TIM2 已经分配给两路舵机 PWM（PA1/PA2），这里不碰任何定时器。 */
 
 /* 全屏空数据，用于清屏和效率测试 */
 static const uint8_t oled_blank[128] = {0};
 
-/**
-  * @brief  TIM2 初始化：72MHz / 72 = 1MHz，自由运行递增计数
-  */
-static void OLED_Timer_Init(void)
+/* 面板是否在线：OLED_Init() 里探测一次。
+ * 不在线时所有绘图函数直接返回，避免每次 I2C 都等超时。 */
+static uint8_t oled_ready = 0;
+
+/* I2C 事务失败计数。写失败时 OLED_ShowChar 不会报错（它只恢复总线就继续），
+ * 屏幕上的表现就是"缺笔划/只显示上半截"。把这个数打到调试串口就能判断
+ * 到底是真的 I2C 出错，还是画的内容问题。 */
+static volatile uint32_t oled_i2c_err = 0u;
+
+uint32_t OLED_GetI2cErrors(void)
 {
-	TIM_TimeBaseInitTypeDef TIM_TimeBaseInitStructure;
-
-	RCC_APB1PeriphClockCmd(OLED_TIM_CLK, ENABLE);
-
-	TIM_TimeBaseInitStructure.TIM_Prescaler = 72 - 1;	/*1MHz -> 1 计数 = 1us*/
-	TIM_TimeBaseInitStructure.TIM_Period = 0xFFFFu;
-	TIM_TimeBaseInitStructure.TIM_ClockDivision = TIM_CKD_DIV1;
-	TIM_TimeBaseInitStructure.TIM_CounterMode = TIM_CounterMode_Up;
-	TIM_TimeBaseInitStructure.TIM_RepetitionCounter = 0;
-	TIM_TimeBaseInit(OLED_TIM, &TIM_TimeBaseInitStructure);
-
-	/*标准库的 TIM_Period 和头文件里的 ARR 都是 uint16_t，会截断；
-	 * TIM2 硬件是 32 位，这里按 32 位直接写 ARR，回绕周期约 71 分钟*/
-	*(volatile uint32_t *)&OLED_TIM->ARR = 0xFFFFFFFFu;
-
-	TIM_SetCounter(OLED_TIM, 0);
-	TIM_Cmd(OLED_TIM, ENABLE);
+	return oled_i2c_err;
 }
 
 /**
-  * @brief  读 TIM2 当前计数值（32 位，单位 us）
-  *         头文件里 CNT 声明为 uint16_t，这里按 32 位读，避免截断
+  * @brief  面板是否在线（1 = 在线，可以画；0 = 没接/没应答，绘图全部跳过）
   */
-static uint32_t OLED_Timer_GetUs(void)
+uint8_t OLED_IsReady(void)
 {
-	return *(volatile uint32_t *)&OLED_TIM->CNT;
+	return oled_ready;
 }
 
-/*引脚初始化：硬件 I2C1，PB6/PB7 复用开漏*/
+/* 引脚初始化：PB10(SCL)/PB11(SDA) 复用开漏 */
 void OLED_I2C_Init(void)
 {
 	GPIO_InitTypeDef GPIO_InitStructure;
 	I2C_InitTypeDef I2C_InitStructure;
 
-	/*开启 GPIOB 与 I2C1 时钟*/
+	/* 开启 GPIOB 与 I2C1 时钟 */
 	RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
 	RCC_APB1PeriphClockCmd(OLED_I2C_CLK, ENABLE);
 
-	/*PB6/PB7 配置为复用开漏输出（I2C 需要外部上拉）*/
+	/* 复用开漏（I2C 需要上拉；模块一般自带 4.7k） */
 	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_OD;
 	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
 	GPIO_InitStructure.GPIO_Pin = OLED_SCL_PIN | OLED_SDA_PIN;
 	GPIO_Init(GPIOB, &GPIO_InitStructure);
 
-	/*I2C1 初始化：主机模式，7 位地址，400kHz*/
+	/* I2C1 初始化：主机模式，7 位地址，400kHz */
 	I2C_DeInit(OLED_I2C);
 	I2C_InitStructure.I2C_Mode = I2C_Mode_I2C;
 	I2C_InitStructure.I2C_DutyCycle = I2C_DutyCycle_2;
@@ -90,6 +85,8 @@ void OLED_I2C_Init(void)
 	I2C_Init(OLED_I2C, &I2C_InitStructure);
 	I2C_Cmd(OLED_I2C, ENABLE);
 }
+
+/* ---------------- 硬件 I2C1 ---------------- */
 
 /**
   * @brief  等待 I2C 事件，带超时
@@ -107,8 +104,7 @@ static uint8_t OLED_I2C_WaitEvent(uint32_t event)
 }
 
 /**
-  * @brief  总线恢复：从机把 SDA 拉死时，手动打 9 个时钟再重新初始化 I2C。
-  *         重新初始化后 SSD1306 内部状态不变，后续绘图可继续。
+  * @brief  总线恢复：从机把 SDA 拉死时，手动打 9 个时钟再把 I2C 外设重新初始化
   */
 static void OLED_I2C_Recover(void)
 {
@@ -118,7 +114,7 @@ static void OLED_I2C_Recover(void)
 
 	I2C_Cmd(OLED_I2C, DISABLE);
 
-	/*切回普通开漏 GPIO，手动产生时钟*/
+	/* 切回普通开漏 GPIO，手动产生时钟 */
 	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_OD;
 	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
 	GPIO_InitStructure.GPIO_Pin = OLED_SCL_PIN | OLED_SDA_PIN;
@@ -133,18 +129,18 @@ static void OLED_I2C_Recover(void)
 		for (d = 0; d < 100u; d++) __NOP();
 	}
 
-	/*手动 STOP：SCL 高电平期间 SDA 由低变高*/
+	/* 手动 STOP：SCL 高电平期间 SDA 由低变高 */
 	GPIO_ResetBits(GPIOB, OLED_SDA_PIN);
 	for (d = 0; d < 100u; d++) __NOP();
 	GPIO_SetBits(GPIOB, OLED_SCL_PIN);
 	for (d = 0; d < 100u; d++) __NOP();
 	GPIO_SetBits(GPIOB, OLED_SDA_PIN);
 
-	OLED_I2C_Init();
+	OLED_I2C_Init();          /* 重新配回复用开漏 + 使能 I2C1 */
 }
 
 /**
-  * @brief  一次事务写入：START + 地址 + 控制字节 + 若干数据 + STOP
+  * @brief  一次事务写入：START + 地址 + 控制字节 + 若干数据 + STOP（硬件 I2C1）
   * @param  control 0x00=写命令，0x40=写数据
   * @retval 1=成功，0=失败（已自动恢复总线）
   */
@@ -167,13 +163,14 @@ static uint8_t OLED_I2C_WriteBytes(uint8_t control, const uint8_t *data, uint16_
 		if (!OLED_I2C_WaitEvent(I2C_EVENT_MASTER_BYTE_TRANSMITTING)) goto error;
 	}
 
-	/*等最后一个字节真正发完（BTF），再发 STOP，避免截断*/
+	/* 等最后一个字节真正发完（BTF），再发 STOP，避免截断 */
 	if (!OLED_I2C_WaitEvent(I2C_EVENT_MASTER_BYTE_TRANSMITTED)) goto error;
 
 	I2C_GenerateSTOP(OLED_I2C, ENABLE);
 	return 1;
 
 error:
+	oled_i2c_err++;                 /* 记一笔：屏幕缺笔划时就靠这个数判断 */
 	I2C_GenerateSTOP(OLED_I2C, ENABLE);
 	OLED_I2C_Recover();
 	return 0;
@@ -184,6 +181,7 @@ error:
   */
 void OLED_WriteCommand(uint8_t Command)
 {
+	if (!oled_ready) return;
 	OLED_I2C_WriteBytes(0x00, &Command, 1);
 }
 
@@ -200,6 +198,7 @@ static void OLED_WriteCommands(const uint8_t *Commands, uint16_t Len)
   */
 void OLED_WriteData(uint8_t Data)
 {
+	if (!oled_ready) return;
 	OLED_I2C_WriteBytes(0x40, &Data, 1);
 }
 
@@ -220,6 +219,8 @@ void OLED_SetCursor(uint8_t Y, uint8_t X)
 {
 	uint8_t cmds[3];
 
+	if (!oled_ready) return;
+
 	cmds[0] = 0xB0 | Y;						/*设置Y位置*/
 	cmds[1] = 0x10 | ((X & 0xF0) >> 4);		/*设置X位置高4位*/
 	cmds[2] = 0x00 | (X & 0x0F);			/*设置X位置低4位*/
@@ -232,6 +233,9 @@ void OLED_SetCursor(uint8_t Y, uint8_t X)
 void OLED_Clear(void)
 {
 	uint8_t j;
+
+	if (!oled_ready) return;
+
 	for (j = 0; j < 8; j++)
 	{
 		OLED_SetCursor(j, 0);
@@ -247,6 +251,8 @@ void OLED_Clear(void)
   */
 void OLED_ShowChar(uint8_t Line, uint8_t Column, char Char)
 {
+	if (!oled_ready) return;
+
 	OLED_SetCursor((Line - 1) * 2, (Column - 1) * 8);			/*设置光标位置在上半部分*/
 	OLED_WriteDataBurst(&OLED_F8x16[Char - ' '][0], 8);			/*一次发完上半部分 8 字节*/
 
@@ -347,6 +353,38 @@ void OLED_ShowBinNum(uint8_t Line, uint8_t Column, uint32_t Number, uint8_t Leng
 }
 
 /**
+  * @brief  探测面板在不在：START + 地址，看有没有 ACK
+  * @retval 1=在线，0=没接/没应答
+  * @note   必须在 OLED_I2C_Init() 之后调用；失败会顺手恢复一次总线
+  */
+static uint8_t OLED_Probe(void)
+{
+	uint16_t timeout = 2000u;
+
+	I2C_GenerateSTART(OLED_I2C, ENABLE);
+	while (I2C_CheckEvent(OLED_I2C, I2C_EVENT_MASTER_MODE_SELECT) == ERROR)
+	{
+		if (--timeout == 0u) goto fail;
+	}
+
+	I2C_Send7bitAddress(OLED_I2C, OLED_SLAVE_ADDR, I2C_Direction_Transmitter);
+
+	timeout = 2000u;
+	while (I2C_CheckEvent(OLED_I2C, I2C_EVENT_MASTER_TRANSMITTER_MODE_SELECTED) == ERROR)
+	{
+		if (--timeout == 0u) goto fail;
+	}
+
+	I2C_GenerateSTOP(OLED_I2C, ENABLE);
+	return 1u;
+
+fail:
+	I2C_GenerateSTOP(OLED_I2C, ENABLE);
+	OLED_I2C_Recover();
+	return 0u;
+}
+
+/**
   * @brief  OLED初始化
   */
 void OLED_Init(void)
@@ -358,8 +396,13 @@ void OLED_Init(void)
 		for (j = 0; j < 1000; j++);
 	}
 
-	OLED_I2C_Init();			//硬件 I2C1 初始化
-	OLED_Timer_Init();			//TIM2 1us 计时，效率测量用
+	OLED_I2C_Init();			//硬件 I2C1（PB6=SCL / PB7=SDA）初始化
+	/* TIM2 已给舵机 PWM 用，这里不再初始化它 */
+
+	/*先探测面板在不在：没接就直接返回，后面所有绘图都会立刻返回，
+	 *不会再一个个等 I2C 超时（否则上电要卡十几秒）*/
+	oled_ready = OLED_Probe();
+	if (!oled_ready) return;
 
 	OLED_WriteCommand(0xAE);	//关闭显示
 
@@ -403,55 +446,36 @@ void OLED_Init(void)
 }
 
 /**
-  * @brief  测量整屏 1024 字节刷新的耗时（内含清屏效果）
-  * @retval 耗时，单位 us
+  * @brief  整屏刷新一次（内含清屏效果）
+  * @retval 固定返回 0：TIM2 已分配给舵机 PWM，这里不再做耗时测量
   */
 uint32_t OLED_MeasureFullFrame(void)
 {
-	uint32_t us_start, us_end;
 	uint8_t page;
 
-	us_start = OLED_Timer_GetUs();				/*1 计数 = 1us*/
+	if (!oled_ready) return 1u;					/*面板不在线：直接给个非 0，避免除零*/
+
 	for (page = 0; page < 8; page++)
 	{
 		OLED_SetCursor(page, 0);				/*3 条命令一次事务*/
 		OLED_WriteDataBurst(oled_blank, 128);	/*128 字节一次事务*/
 	}
-	us_end = OLED_Timer_GetUs();
 
-	/*无符号相减，计数器回绕时结果仍正确*/
-	return us_end - us_start;
+	return 0u;									/*无计时（TIM2 已给舵机）*/
 }
 
 /**
-  * @brief  硬件 I2C 效率测试：测全屏刷新耗时，结果显示在 OLED 第 3、4 行
-  * @retval 全屏耗时，单位 us
+  * @brief  硬件 I2C 效率测试（已停用：TIM2 给了舵机 PWM）
+  * @retval 固定返回 0
   *
-  * 说明：
-  *   KB/s = 1024 字节 / 耗时；
-  *   占用率 = 实际传输位(1024字节×9位，含ACK) / 400kbit/s 总线在该时间内能传的位数。
-  * 注意：测试过程会清空屏幕，请在其它绘图之前调用。
+  * 说明：原来用 TIM2 自由计数测全屏刷新耗时，TIM2 现在被三路舵机占用，
+  *       所以这里只清屏、不再显示 us / KB/s / 占用率。
   */
 uint32_t OLED_ShowI2CStats(void)
 {
-	uint32_t us, kbytes_s, util;
+	if (!oled_ready) return 0u;					/*面板不在线：不做效率测试，立刻返回*/
 
-	us = OLED_MeasureFullFrame();
-	if (us == 0u) us = 1u;
+	OLED_MeasureFullFrame();					/*只清屏，不测时间*/
 
-	kbytes_s = 1000000u / us;		/*1024B / us µs = 1e6/us KB/s*/
-	util = 2304000u / us;			/*9216bit×100% / (0.4bit/µs×us) */
-	if (util > 100u) util = 100u;
-
-	OLED_ShowString(3, 1, "REFRESH");
-	OLED_ShowNum(3, 9, us, 5);
-	OLED_ShowString(3, 15, "us");
-
-	OLED_ShowString(4, 1, "I2C");
-	OLED_ShowNum(4, 5, kbytes_s, 3);
-	OLED_ShowString(4, 8, "KB/s");
-	OLED_ShowNum(4, 13, util, 3);
-	OLED_ShowString(4, 16, "%");
-
-	return us;
+	return 0u;
 }
