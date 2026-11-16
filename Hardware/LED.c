@@ -48,3 +48,12 @@ void PC13_pulse(void){
 	GPIO_ResetBits(GPIOC, GPIO_Pin_13);
 	Delay_ms(1000);
 }
+
+/* ===== moved from main.c (logic unchanged): pc13_step_blink ===== */
+/* 每做完一个动作闪一下 PC13：确认"按键被识别、动作执行了" */
+void pc13_step_blink(void)
+{
+    GPIO_ResetBits(GPIOC, GPIO_Pin_13);   /* 亮（低电平点亮） */
+    Delay_ms(60);
+    GPIO_SetBits(GPIOC, GPIO_Pin_13);     /* 灭 */
+}

@@ -464,6 +464,39 @@ uint32_t OLED_MeasureFullFrame(void)
 	return 0u;									/*无计时（TIM2 已给舵机）*/
 }
 
+/* ============================================================================
+ * 三个显示工具（从 main.c 原样搬过来，逻辑未改）
+ * 多个模块都要用，所以放在驱动层，避免每个业务模块各写一份。
+ * ========================================================================== */
+
+/* 一个数占几位（1~10）。画可变宽数字前先算位数，避免残留旧数字的尾巴。 */
+uint8_t OLED_Digits(uint32_t v)
+{
+    uint8_t n = 1u;
+
+    while(v >= 10u){ v /= 10u; n++; }
+    return n;
+}
+
+/* 清一整行：写 16 个空格，擦掉旧数字的尾巴。 */
+void OLED_ClearLine(uint8_t Line)
+{
+    OLED_ShowString(Line, 1, "                ");   /* 16 个空格 */
+}
+
+/* 把 0.01 单位的整数显示成 ±ddd.cc（固定占 7 列）。
+ * 例：-512 -> "-05.12" 的写法（符号 + 3 位整数 + '.' + 2 位小数），12345 -> "+123.45"。
+ * 原来叫 turn_show_2dp()，因为最早只给闭环转向用；现在角度、斜率都复用。 */
+void OLED_ShowCentiDeg(uint8_t line, uint8_t col, int32_t centi)
+{
+    int32_t v = (centi < 0L) ? -centi : centi;
+
+    OLED_ShowChar(line, col, (centi < 0L) ? '-' : '+');
+    OLED_ShowNum(line, (uint8_t)(col + 1u), (uint32_t)(v / 100L), 3);
+    OLED_ShowChar(line, (uint8_t)(col + 4u), '.');
+    OLED_ShowNum(line, (uint8_t)(col + 5u), (uint32_t)(v % 100L), 2);
+}
+
 /**
   * @brief  硬件 I2C 效率测试（已停用：TIM2 给了舵机 PWM）
   * @retval 固定返回 0

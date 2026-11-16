@@ -90,6 +90,15 @@ uint16_t motor_get_accel(void);
 /* 使能 4 个电机：上电默认失能，移动前先调一次 */
 void motor_enable_all(void);
 
+/* ---- 等四个轮子到位（0x3A 查询，阻塞）----
+ * judge_wait() 带轮数上限：一轮约 220 ms，某个地址的驱动器不在线时能很快报错。
+ *   judge_wait(60000u)  → 正式流程（基本不会触发上限）
+ *   judge_wait(40u/60u) → 自检模式，驱动器不在线时很快返回 0
+ * judge() 就是 judge_wait(60000u) 的包装。
+ * 返回 1 = 四个都到位，0 = 超时（有驱动器没应答）。 */
+uint8_t judge_wait(uint16_t max_rounds);
+uint8_t judge(void);
+
 /* 使能单个地址（1~4 之外的电机，比如物料电机地址 5）：失能状态下运动命令会被忽略 */
 void motor_enable_addr(uint8_t addr);
 extern volatile uint8_t uart_key_num;

@@ -784,9 +784,59 @@
               <FilePath>.\app\motor.c</FilePath>
             </File>
             <File>
+              <FileName>lift_motor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\lift_motor.c</FilePath>
+            </File>
+            <File>
+              <FileName>material_motor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\material_motor.c</FilePath>
+            </File>
+            <File>
+              <FileName>servo_test.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\servo_test.c</FilePath>
+            </File>
+            <File>
+              <FileName>motion.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\motion.c</FilePath>
+            </File>
+            <File>
+              <FileName>vision.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\vision.c</FilePath>
+            </File>
+            <File>
               <FileName>motor.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\app\motor.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_motor.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\lift_motor.h</FilePath>
+            </File>
+            <File>
+              <FileName>material_motor.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\material_motor.h</FilePath>
+            </File>
+            <File>
+              <FileName>servo_test.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\servo_test.h</FilePath>
+            </File>
+            <File>
+              <FileName>motion.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\motion.h</FilePath>
+            </File>
+            <File>
+              <FileName>vision.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\vision.h</FilePath>
             </File>
             <File>
               <FileName>chassis.c</FileName>
@@ -1600,9 +1650,59 @@
               <FilePath>.\app\motor.c</FilePath>
             </File>
             <File>
+              <FileName>lift_motor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\lift_motor.c</FilePath>
+            </File>
+            <File>
+              <FileName>material_motor.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\material_motor.c</FilePath>
+            </File>
+            <File>
+              <FileName>servo_test.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\servo_test.c</FilePath>
+            </File>
+            <File>
+              <FileName>motion.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\motion.c</FilePath>
+            </File>
+            <File>
+              <FileName>vision.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\app\vision.c</FilePath>
+            </File>
+            <File>
               <FileName>motor.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\app\motor.h</FilePath>
+            </File>
+            <File>
+              <FileName>lift_motor.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\lift_motor.h</FilePath>
+            </File>
+            <File>
+              <FileName>material_motor.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\material_motor.h</FilePath>
+            </File>
+            <File>
+              <FileName>servo_test.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\servo_test.h</FilePath>
+            </File>
+            <File>
+              <FileName>motion.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\motion.h</FilePath>
+            </File>
+            <File>
+              <FileName>vision.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\app\vision.h</FilePath>
             </File>
             <File>
               <FileName>chassis.c</FileName>

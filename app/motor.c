@@ -1,6 +1,8 @@
+#include "stm32f10x.h"
 #include "motor.h"
 #include "Serial.h"
 #include "Delay.h"
+#include "OLED.h"
 
 /*
  * 依赖你工程里的串口/延时函数（请确保对应头文件已包含）：
@@ -410,4 +412,83 @@ void motor_set_pos(int32_t pos)
     cmd[9] = (uint8_t)(absp);
 
     Serial_SendArray(cmd, 13);
+}
+
+/* ============================================================================
+ * 等四个轮子都到位（0x3A 查询）—— 从 main.c 搬过来，逻辑未改
+ * ----------------------------------------------------------------------------
+ * 为什么放在这个文件：几乎所有模块都要"发完命令等它走完"，是最底层的等待。
+ * 注意它会写 OLED 第 2 行（显示查询轮数），所以依赖 OLED.h。
+ * ========================================================================== */
+
+/* 查询轮数显示用的计数器（原来是 main.c 的文件级 static，跟着搬过来） */
+static u16 judge_trans_display_count = 0;
+
+/* ===== moved from main.c (logic unchanged): judge_wait ===== */
+/* 等待四个驱动电机全部到位。
+ * 0x3A 查询的回包格式为 [地址][0x3A][状态][0x6B]，其中状态字节 (Serial_RxPacket[2])
+ * 为 0x03 时表示该电机已到达。每查一个地址，先清标志再发查询，然后阻塞等回包，
+ * 确认回包地址与本电机一致后再判断到位，避免把别的电机的回包误判成自己的。
+ * max_rounds 是轮询轮数上限（一轮约 220 ms）：正式流程给 60000（约几小时，基本不会触发），
+ * 自检模式给几十轮，某个地址的驱动器不在线时能很快报错而不是卡住。 */
+u8 judge_wait(u16 max_rounds)
+{
+    u8 judge1 = 0, judge2 = 0, judge3 = 0, judge4 = 0;
+    u16 t, guard = 0;
+
+    while(1){
+        if(judge1 == 0){
+            Serial_RxFlag = 0;
+            Serial_RxPacket[0] = Serial_RxPacket[1] = Serial_RxPacket[2] = Serial_RxPacket[3] = 0;
+            Serial_SendByte(0x01); Serial_SendByte(0x3A); Serial_SendByte(0x6B);
+            for(t = 0; t < 50; t++){ if(Serial_GetRxFlag()) break; Delay_ms(1); }
+            if(Serial_RxPacket[0] == 0x01 && Serial_RxPacket[1] == 0x3A && Serial_RxPacket[2] == 0x03)
+                judge1 = 1;
+        }
+        Delay_ms(5);
+        if(judge2 == 0){
+            Serial_RxFlag = 0;
+            Serial_RxPacket[0] = Serial_RxPacket[1] = Serial_RxPacket[2] = Serial_RxPacket[3] = 0;
+            Serial_SendByte(0x02); Serial_SendByte(0x3A); Serial_SendByte(0x6B);
+            for(t = 0; t < 50; t++){ if(Serial_GetRxFlag()) break; Delay_ms(1); }
+            if(Serial_RxPacket[0] == 0x02 && Serial_RxPacket[1] == 0x3A && Serial_RxPacket[2] == 0x03)
+                judge2 = 1;
+        }
+        Delay_ms(5);
+        if(judge3 == 0){
+            Serial_RxFlag = 0;
+            Serial_RxPacket[0] = Serial_RxPacket[1] = Serial_RxPacket[2] = Serial_RxPacket[3] = 0;
+            Serial_SendByte(0x03); Serial_SendByte(0x3A); Serial_SendByte(0x6B);
+            for(t = 0; t < 50; t++){ if(Serial_GetRxFlag()) break; Delay_ms(1); }
+            if(Serial_RxPacket[0] == 0x03 && Serial_RxPacket[1] == 0x3A && Serial_RxPacket[2] == 0x03)
+                judge3 = 1;
+        }
+        Delay_ms(5);
+        if(judge4 == 0){
+            Serial_RxFlag = 0;
+            Serial_RxPacket[0] = Serial_RxPacket[1] = Serial_RxPacket[2] = Serial_RxPacket[3] = 0;
+            Serial_SendByte(0x04); Serial_SendByte(0x3A); Serial_SendByte(0x6B);
+            for(t = 0; t < 50; t++){ if(Serial_GetRxFlag()) break; Delay_ms(1); }
+            if(Serial_RxPacket[0] == 0x04 && Serial_RxPacket[1] == 0x3A && Serial_RxPacket[2] == 0x03)
+                judge4 = 1;
+        }
+        Delay_ms(5);
+
+        if(judge1 == 1 && judge2 == 1 && judge3 == 1 && judge4 == 1){
+            return 1;
+        }
+
+        OLED_ShowNum(2, 1, judge_trans_display_count++, 5);
+
+        if(++guard > max_rounds){   /* 安全兜底：电机不应答/地址不存在时退出 */
+            return 0;
+        }
+    }
+}
+
+/* ===== moved from main.c (logic unchanged): judge ===== */
+/* 正式流程用的默认等待：上限 60000 轮，基本只在电机死机时触发。 */
+u8 judge(void)
+{
+    return judge_wait(60000u);
 }
