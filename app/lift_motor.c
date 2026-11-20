@@ -222,7 +222,12 @@ void lift_motor_move_rel(uint32_t pulses, uint8_t dir)
 }
 
 /* 用驱动器实际位置校准跟踪值。
- * 只在差得比较多（>500 脉冲）时才改，避免读数噪声来回抖。 */
+ * 只在差得比较多（>500 脉冲）时才改，避免读数噪声来回抖。
+ *
+ * ★ 2026-11-21：用相对帧（LIFT_USE_REL_FRAME=1）时**只提示、不校准**。
+ *   原因：现在"走到哪"完全由我们自己的命令累加出来；而驱动器那个坐标的语义
+ *   还没搞清（它把脉冲当行程用）。一旦拿它的数覆盖 g_lift_target，
+ *   下一段行程就会从错的位置算起，反而制造偏差。 */
 void lift_motor_sync(void)
 {
     int32_t act = 0;
@@ -234,9 +239,15 @@ void lift_motor_sync(void)
 
     if((act > (int32_t)g_lift_target + 500) || (act < (int32_t)g_lift_target - 500))
     {
+#if LIFT_USE_REL_FRAME
+        USART3_Printf("[LIFT] 提示：驱动器报 %d，我们跟踪 %u，差 %d（相对帧模式下不校准）\r\n",
+                      (int)act, (unsigned)g_lift_target,
+                      (int)(act - (int32_t)g_lift_target));
+#else
         USART3_Printf("[LIFT] 位置自校准：跟踪 %u -> 驱动器 %d\r\n",
                       (unsigned)g_lift_target, (int)act);
         g_lift_target = (uint32_t)act;
+#endif
     }
 }
 

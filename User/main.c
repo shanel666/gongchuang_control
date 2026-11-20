@@ -57,7 +57,7 @@
  *   gcc -DDEBUG_MODE=3
  *   Keil Options → C/C++ → Define 里填 DEBUG_MODE=3 */
 #ifndef DEBUG_MODE
-#define DEBUG_MODE          DEBUG_MODE_LIFT_TEST
+#define DEBUG_MODE          DEBUG_MODE_CAR_PUT
 #endif
 
 #if DEBUG_MODE == DEBUG_MODE_ROUTE
@@ -3018,22 +3018,23 @@ static void servo_test_run(void)
 #define CP_LIFT_SOFT_LANDING  0u
 
 /* ★ 下降"少走一点"补偿（脉冲）：正数 = 每次下降都停在**更高**的位置。
- *   现场现象："降下来的时候总是降多一点" —— 绝对位置模式下终点本该是精确的，
- *   多降是垂直轴受重力丢步（上升顶着重物，减速时负载帮着停；下降重物推着电机，
- *   减速时电机拉不住就多走几步），而驱动器自己不知道，我们读不到 ACT 也纠正不了。
  *
- * ★ 2026-11-21 现场定案：按"上升脉冲 − 500"来降，也就是每次少降 500 脉冲
- *   （500 脉冲 = 1/6.4 圈）。效果：
- *       步⑤ DN1000 ：7600 → 1500（原来 → 1100）
- *       步⑩ DN0    ：7600 → 500 （原来 → 100）
- *   如果 500 不够（还过零），现场发 D800 / D1000 继续加大，不用重烧；
- *   觉得降得不够（夹不到料），发 D300 减小。 */
-#define CP_DESCEND_TRIM    500u
+ * ★ 2026-11-21 归零了 —— 因为"降过头"的**根因已经修掉**：
+ *     根因不是我原来以为的"重力丢步"，而是**帧的语义错了**：
+ *     驱动器把脉冲字段当"要走多少"，我们一直发"走到哪个坐标"，
+ *     于是上升看起来正常、下降变成"按目标坐标当行程走一大段"。
+ *     现在 lift_motor_move() 统一换算成差值 + 相对帧（LIFT_USE_REL_FRAME=1），
+ *     走多少就是多少，不再需要预先把目标抬高。
+ *
+ *   这个数现在是纯微调：
+ *       发现下降比预期低（压太死）→ D200 / D300
+ *       发现降不到底（悬空）      → D0（现在就是 0）
+ *   D<n> 现场改，立即生效，不用重烧。 */
+#define CP_DESCEND_TRIM    0u
 
 /* ★ 机械底防呆：驱动器报回的位置 ACT <= 这个值时，**拒绝再执行下降命令**。
- *   不管"多转"是丢步、零点错还是别的原因，都不会一轮一轮越降越深、越顶越死。
  *   注意：这条要靠 0x36 读位置才生效，而现场 `ACT=-9999`（读不到），
- *   所以它目前**兜不住**，只能靠上面的补偿把目标抬高。 */
+ *   所以它目前**兜不住**；真正防呆靠的是"走多少"的相对帧 + 你眼睛盯着。 */
 #define CP_FLOOR_GUARD     60u
 
 #define CP_PH_IDLE  0u
@@ -3704,7 +3705,7 @@ static void cp_descent_probe(void)
     if(err < -(int32_t)CP_PROBE_TOL){
         USART3_Printf("[CARPUT] ❌ 冲过头 %d 脉冲（走比要的多）\r\n", (int)(-err));
         USART3_SendString("[CARPUT]   → 驱动器没在按绝对位置停，或者下降时被重力带过了头\r\n");
-        USART3_SendString("[CARPUT]   → 对策：把 LIFT_MOTOR_SPEED_DOWN 再降一档（20→10）\r\n");
+        USART3_SendString("[CARPUT]   → 对策：先把速度降一档再试（模式13 里发 V15），或加大 D 补偿\r\n");
     }else if(err > (int32_t)CP_PROBE_TOL){
         USART3_Printf("[CARPUT] ❌ 没走到位，差 %d 脉冲（走比要的少）\r\n", (int)err);
         USART3_SendString("[CARPUT]   → 等待时间不够（命令被下一条打断），或驱动器丢步\r\n");
@@ -5906,7 +5907,7 @@ int main(void)
 #elif DEBUG_MODE == DEBUG_MODE_SERVO_TEST
 	servo_test_run();           /* ★ 舵机单独测试：PC2/PC3 加减角度，PA5 回初始，PA7 自动扫描 */
 #elif DEBUG_MODE == DEBUG_MODE_CAR_PUT
-	car_put_run();              /* ★ 车上取料→放台面：PB1/PC2 单步，PA7 连跑，PA5 中止 */
+	car_put_run();              /* ★ 车上取料→放地上：PC3 一按一个动作，PA5 中止 */
 #elif DEBUG_MODE == DEBUG_MODE_LIFT_TEST
 	lift_test_run();            /* ★ 升降电机高度调试：PB1/PA7 升降，PC2 步长，PC3 回零 */
 #elif DEBUG_MODE == DEBUG_MODE_LIFT_RAW

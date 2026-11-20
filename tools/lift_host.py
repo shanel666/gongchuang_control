@@ -23,7 +23,7 @@
     W         把当前位置设为驱动器零点（0x93 0x88）   ★ 对零用
     P         抓 0x36 的原始回包（判断驱动器答不答）  ★ 查通信
     E         分段下降到 0（每段 500，找堵转高度）    ★ 查堵转
-    V<rpm>    运行期改速度（0 = 恢复默认 升40/降20）
+    V<rpm>    运行期改速度（0 = 恢复默认 升40/降30；注意这是**双向**覆盖）
     A<accel>  运行期改加速度档（0 = 恢复默认 80）
     S         查询状态 → 回 STATUS
     X         急停
@@ -403,7 +403,7 @@ class LiftApp(object):
         pr4 = ttk.Frame(pre)
         pr4.pack(fill="x", padx=4, pady=(0, 6))
 
-        ttk.Label(pr4, text="速度 RPM（空/0 = 默认升40降20）").pack(side="left")
+        ttk.Label(pr4, text="速度 RPM（空/0 = 默认升40降30）").pack(side="left")
         self.var_spd = tk.StringVar(value="")
         ttk.Entry(pr4, textvariable=self.var_spd, width=6).pack(side="left", padx=4)
         self.btn_spd = ttk.Button(pr4, text="发 V", width=6, command=self._send_speed)
