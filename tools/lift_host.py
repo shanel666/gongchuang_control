@@ -20,9 +20,24 @@
     D<step>   下降 step 脉冲        例 D100
     G<pos>    走到绝对位置 pos      例 G1500
     Z         回零（绝对 0）
+    W         把当前位置设为驱动器零点（0x93 0x88）   ★ 对零用
+    P         抓 0x36 的原始回包（判断驱动器答不答）  ★ 查通信
+    E         分段下降到 0（每段 500，找堵转高度）    ★ 查堵转
+    V<rpm>    运行期改速度（0 = 恢复默认 升40/降20）
+    A<accel>  运行期改加速度档（0 = 恢复默认 80）
     S         查询状态 → 回 STATUS
     X         急停
+    C         清故障锁
     H         帮助
+
+=================================================================
+遇到"下降总是多转、越走越低"怎么办
+=================================================================
+    1) 先点「原始包 P」：回包正常是 06 36 00 xx xx xx xx 6B
+       全 00 / RxFlag=0  → 驱动器不答 0x36，位置完全读不到（这就是漂的根源）
+    2) 对零：用 ↓ 一点点降到要当 0 的位置 → 点「设零点 W」
+    3) 降速试试：速度填 10 → 点「发 V」，再走几次下降看还过不过零
+    4) 想找堵转高度：点「分段下降到 0 E」，最后打印的那一段就是卡住的位置
 
 F103 会这样回（本程序就是解析这些行）：
     [LIFT] HOST> U100
@@ -109,6 +124,24 @@ def build_cmd(action, value=None):
         return "C"
     if action == "help":
         return "H"
+
+    # ---- 2026-11-21 新增（模式 13 的调试台）----
+    if action == "setzero":
+        return "W"          # 把当前位置设为驱动器零点
+    if action == "raw":
+        return "P"          # 抓 0x36 的原始回包
+    if action == "seg":
+        return "E"          # 分段下降到 0（找堵转高度）
+
+    if action == "speed":
+        v = 0 if value is None else int(value)
+        v = max(0, min(60, v))
+        return "V%d" % v    # 0 = 取消覆盖，恢复默认（升 40 / 降 20）
+
+    if action == "accel":
+        v = 0 if value is None else int(value)
+        v = max(0, min(255, v))
+        return "A%d" % v    # 0 = 恢复默认 LIFT_MOTOR_ACCEL
 
     raise ValueError("unknown action: %r" % (action,))
 
@@ -349,6 +382,42 @@ class LiftApp(object):
         ttk.Label(pr2, text="（判断驱动器认不认绝对定位）",
                   foreground="#666").pack(side="left", padx=4)
 
+        # ===== 对零 / 抓包 / 分段下降 / 速度加速度（2026-11-21 新增）=====
+        pr3 = ttk.Frame(pre)
+        pr3.pack(fill="x", padx=4, pady=(0, 6))
+
+        self.btn_setzero = ttk.Button(pr3, text="设零点 W", width=10,
+                                      command=lambda: self._send_action("setzero"))
+        self.btn_setzero.pack(side="left", padx=4)
+        ttk.Label(pr3, text="（降到要当 0 的位置再点）",
+                  foreground="#666").pack(side="left", padx=2)
+
+        self.btn_raw = ttk.Button(pr3, text="原始包 P", width=10,
+                                  command=lambda: self._send_action("raw"))
+        self.btn_raw.pack(side="left", padx=(10, 4))
+
+        self.btn_seg = ttk.Button(pr3, text="分段下降到 0 E", width=14,
+                                  command=lambda: self._send_action("seg"))
+        self.btn_seg.pack(side="left", padx=(10, 4))
+
+        pr4 = ttk.Frame(pre)
+        pr4.pack(fill="x", padx=4, pady=(0, 6))
+
+        ttk.Label(pr4, text="速度 RPM（空/0 = 默认升40降20）").pack(side="left")
+        self.var_spd = tk.StringVar(value="")
+        ttk.Entry(pr4, textvariable=self.var_spd, width=6).pack(side="left", padx=4)
+        self.btn_spd = ttk.Button(pr4, text="发 V", width=6, command=self._send_speed)
+        self.btn_spd.pack(side="left", padx=2)
+
+        ttk.Label(pr4, text="    加速度档（空/0 = 默认80）").pack(side="left")
+        self.var_acc = tk.StringVar(value="")
+        ttk.Entry(pr4, textvariable=self.var_acc, width=6).pack(side="left", padx=4)
+        self.btn_acc = ttk.Button(pr4, text="发 A", width=6, command=self._send_accel)
+        self.btn_acc.pack(side="left", padx=2)
+
+        ttk.Label(pr4, text="（改完立即对下一条移动生效，掉电恢复）",
+                  foreground="#666").pack(side="left", padx=6)
+
         row4 = ttk.Frame(ctl)
         row4.pack(fill="x", padx=6, pady=(0, 6))
         ttk.Button(row4, text="帮助 H", width=10,
@@ -512,6 +581,22 @@ class LiftApp(object):
         except ValueError:
             messagebox.showwarning("相对量不对", "不能是 0")
 
+    def _send_speed(self):
+        try:
+            v = int(self.var_spd.get().strip() or "0")
+        except Exception:
+            messagebox.showwarning("速度不对", "速度要填整数 RPM（0 = 恢复默认）")
+            return
+        self._send_line(build_cmd("speed", v))
+
+    def _send_accel(self):
+        try:
+            v = int(self.var_acc.get().strip() or "0")
+        except Exception:
+            messagebox.showwarning("加速度不对", "加速度要填整数档位（0 = 恢复默认）")
+            return
+        self._send_line(build_cmd("accel", v))
+
     # ---------------- 接收队列 ----------------
     def _drain_queue(self):
         got = 0
@@ -619,7 +704,8 @@ class LiftApp(object):
     def _set_enabled(self, on):
         state = "normal" if on else "disabled"
         for b in (self.btn_up, self.btn_down, self.btn_zero, self.btn_read,
-                  self.btn_stop, self.btn_go, self.btn_rel, self.btn_clear_fault):
+                  self.btn_stop, self.btn_go, self.btn_rel, self.btn_clear_fault,
+                  self.btn_setzero, self.btn_raw, self.btn_seg, self.btn_spd, self.btn_acc):
             try:
                 b.configure(state=state)
             except Exception:
@@ -637,8 +723,10 @@ class LiftApp(object):
 
 def selftest():
     fails = []
+    total = [0]
 
     def check(name, got, want):
+        total[0] += 1
         if got != want:
             fails.append("%s: got %r, want %r" % (name, got, want))
 
@@ -651,6 +739,16 @@ def selftest():
     check("stop", build_cmd("stop"), "X")
     check("go", build_cmd("go", 1500), "G1500")
     check("go 0", build_cmd("go", 0), "G0")
+
+    # 2026-11-21 新增的调试台命令
+    check("setzero", build_cmd("setzero"), "W")
+    check("raw", build_cmd("raw"), "P")
+    check("seg", build_cmd("seg"), "E")
+    check("speed", build_cmd("speed", 12), "V12")
+    check("speed 0", build_cmd("speed", 0), "V0")
+    check("speed clamp", build_cmd("speed", 999), "V60")
+    check("accel", build_cmd("accel", 40), "A40")
+    check("accel clamp", build_cmd("accel", 999), "A255")
 
     i = parse_line("[LIFT] NOW cmd=100 act=100 d=0 step=100 OK")
     check("now kind", i.get("kind"), "now")
@@ -695,7 +793,7 @@ def selftest():
             print("  -", f)
         return 1
 
-    print("SELFTEST OK（%d 项）" % 24)
+    print("SELFTEST OK（%d 项）" % total[0])
     return 0
 
 

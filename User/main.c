@@ -57,7 +57,7 @@
  *   gcc -DDEBUG_MODE=3
  *   Keil Options → C/C++ → Define 里填 DEBUG_MODE=3 */
 #ifndef DEBUG_MODE
-#define DEBUG_MODE          DEBUG_MODE_CAR_PUT
+#define DEBUG_MODE          DEBUG_MODE_LIFT_TEST
 #endif
 
 #if DEBUG_MODE == DEBUG_MODE_ROUTE
@@ -3019,10 +3019,22 @@ static void servo_test_run(void)
 
 /* ★ 下降"少走一点"补偿（脉冲）：正数 = 每次下降都停在**更高**的位置。
  *   现场现象："降下来的时候总是降多一点" —— 绝对位置模式下终点本该是精确的，
- *   多降通常是垂直轴受重力丢步，或者驱动器零点比机械底低一点。
- *   先用 T（下降探针）量出实际误差，再把这个数设成"误差的量级"即可。
- *   串口命令 D<n> 可以现场改（D0 关掉），不用重烧。 */
-#define CP_DESCEND_TRIM    100u
+ *   多降是垂直轴受重力丢步（上升顶着重物，减速时负载帮着停；下降重物推着电机，
+ *   减速时电机拉不住就多走几步），而驱动器自己不知道，我们读不到 ACT 也纠正不了。
+ *
+ * ★ 2026-11-21 现场定案：按"上升脉冲 − 500"来降，也就是每次少降 500 脉冲
+ *   （500 脉冲 = 1/6.4 圈）。效果：
+ *       步⑤ DN1000 ：7600 → 1500（原来 → 1100）
+ *       步⑩ DN0    ：7600 → 500 （原来 → 100）
+ *   如果 500 不够（还过零），现场发 D800 / D1000 继续加大，不用重烧；
+ *   觉得降得不够（夹不到料），发 D300 减小。 */
+#define CP_DESCEND_TRIM    500u
+
+/* ★ 机械底防呆：驱动器报回的位置 ACT <= 这个值时，**拒绝再执行下降命令**。
+ *   不管"多转"是丢步、零点错还是别的原因，都不会一轮一轮越降越深、越顶越死。
+ *   注意：这条要靠 0x36 读位置才生效，而现场 `ACT=-9999`（读不到），
+ *   所以它目前**兜不住**，只能靠上面的补偿把目标抬高。 */
+#define CP_FLOOR_GUARD     60u
 
 #define CP_PH_IDLE  0u
 #define CP_PH_FWD   1u
@@ -3444,12 +3456,29 @@ static uint8_t cp_apply(const CarPutStep *s)
         return 1u;                       /* 已经在这个高度，什么都不用做 */
     }
 
-    /* ★ 每次升降都打一行：一眼能看出"上升还是下降、目标多少、走多远" */
-    USART3_Printf("[CARPUT]   升降 %u -> %u  %s %u RPM\r\n",
-                  (unsigned)g_lift_target, (unsigned)aim,
-                  (aim < g_lift_target) ? "下降" : "上升",
-                  (unsigned)((aim < g_lift_target) ? LIFT_MOTOR_SPEED_DOWN
-                                                   : LIFT_MOTOR_SPEED));
+    /* ★ 每次升降都打一行，并带上驱动器**自己报的位置**（ACT）。
+     *   "降过头"只有两种可能，这一行就能分辨：
+     *     ACT 也跑到了目标附近 → 驱动器确实走过去了（丢步/没按绝对位置停）
+     *     ACT 还停在目标上     → 驱动器以为自己在目标，实际机械更低（丢步更多）
+     *   同时用它做防呆：ACT 已经在机械底附近就拒绝继续下降，避免越降越深。 */
+    {
+        int32_t act_now = 0;
+        uint8_t have_act = lift_motor_read_pos(&act_now);
+        uint8_t going_down = (aim < g_lift_target) ? 1u : 0u;
+
+        USART3_Printf("[CARPUT]   升降 %u -> %u  %s %u RPM  ACT=%d\r\n",
+                      (unsigned)g_lift_target, (unsigned)aim,
+                      going_down ? "下降" : "上升",
+                      (unsigned)(going_down ? LIFT_MOTOR_SPEED_DOWN : LIFT_MOTOR_SPEED),
+                      have_act ? (int)act_now : -9999);
+
+        if(going_down && have_act && (act_now <= (int32_t)CP_FLOOR_GUARD)){
+            USART3_Printf("[CARPUT] ⚠ ACT=%d 已在机械底附近（<=%u），拒绝继续下降\r\n",
+                          (int)act_now, (unsigned)CP_FLOOR_GUARD);
+            USART3_SendString("[CARPUT]   要重新对零：模式16 里用 ↓ 降到低位再按 W 设零点\r\n");
+            return 1u;                   /* 不动，也不往下走 */
+        }
+    }
 
 #if CP_STEP_NO_WAIT
     /* ★ 只把命令发出去就返回：上一条还在走也可以直接按下一条，
@@ -3695,6 +3724,9 @@ static void lift_test_run(void);
 /* 打一行完整状态（含 K230 链路计数器，用来判断视觉到底通不通） */
 static void cp_status(void)
 {
+    int32_t act = 0;
+    uint8_t ok  = lift_motor_read_pos(&act);
+
     USART3_Printf("[CARPUT] STATUS phase=%u fwd=%u/%u undo=%u/%u MOT=%u ROT=%u GRIP=%u LIFT=%u\r\n",
                   (unsigned)g_cp_phase,
                   (unsigned)g_cp_fwd, (unsigned)CP_STEP_COUNT,
@@ -3703,6 +3735,16 @@ static void cp_status(void)
                   (unsigned)Servo_GetAngle(SERVO_ROT),
                   (unsigned)Servo_GetAngle(SERVO_GRIP),
                   (unsigned)Servo_GetAngle(SERVO_LIFT));
+
+    /* ★ 升降的"我们以为的位置" vs "驱动器自己报的位置"。
+     *   两个数一偏离，就说明下降时丢步了（驱动器数的是它发出去的脉冲数，
+     *   机械被重力带着多走了它并不知道），这就是"降过头"的根源。
+     *   d = ACT - MOT，负得越多 = 机械比我们以为的更低。 */
+    USART3_Printf("[CARPUT] 升降 MOT=%u ACT=%d d=%d  %s\r\n",
+                  (unsigned)g_lift_target,
+                  ok ? (int)act : -9999,
+                  ok ? (int)(act - (int32_t)g_lift_target) : 0,
+                  ok ? "OK" : "NO-ANSWER(0x36 没回)");
 
     /* ★ K230 链路健康度：C_seq 一直不动 = 一帧都没收到（命令没到 / 没在跑脚本）
      *   BAD 一直涨 = 收到字节了但格式不对（多半波特率/接线反了） */
@@ -3805,7 +3847,7 @@ static uint8_t cp_auto_sequence(char *label)
     }else if(g_cp_fwd >= CP_STEP_COUNT){
         g_cp_phase = CP_PH_DONE;       /* 全部做完了：停住，不自动弹栈 */
         USART3_SendString("[CARPUT] ✅ 全部动作发完了，就停在这个姿态\r\n");
-        USART3_SendString("[CARPUT]    再跑一次：先按 PC0 复位，再按 PC3\r\n");
+        USART3_SendString("[CARPUT]    再跑一轮：直接按 PC3 就从头开始；回退用 B\r\n");
     }else{
         USART3_Printf("[CARPUT] 下一条是 %u/%u：%s（按 PC3 做它）\r\n",
                       (unsigned)(g_cp_fwd + 1u), (unsigned)CP_STEP_COUNT,
@@ -3854,6 +3896,15 @@ static uint8_t cp_step_back(char *label)
 
     cp_show(label);
     return 1u;
+}
+
+/* 十六进制打印一个字节（USART3_Printf 不支持 %x，自己拼） */
+static void cp_put_hex8(uint8_t v)
+{
+    static const char hx[] = "0123456789ABCDEF";
+
+    USART3_SendByte((uint8_t)hx[(v >> 4) & 0x0Fu]);
+    USART3_SendByte((uint8_t)hx[v & 0x0Fu]);
 }
 
 /* 上位机命令（无线串口 USART3 收，一行一条） */
@@ -3967,6 +4018,34 @@ static void cp_host_cmd(char *line, char *label)
             USART3_SendString("[CARPUT] HOST -> 急停\r\n");
             break;
 
+        case 'P':                                     /* 0x36 原始回包测试 */
+        {
+            uint8_t  k;
+            uint16_t t;
+
+            USART3_SendString("[CARPUT] 发 0x36 读位置，抓原始回包（最多等 300 ms）…\r\n");
+            Serial_RxFlag = 0;
+            Serial_SendByte(LIFT_MOTOR_ADDR);
+            Serial_SendByte(0x36);
+            Serial_SendByte(0x6B);
+
+            for(t = 0u; t < 300u; t++){
+                if(Serial_RxFlag != 0) break;
+                Delay_ms(1);
+            }
+
+            USART3_Printf("[CARPUT] RxFlag=%u  等了 %u ms  raw =",
+                          (unsigned)Serial_RxFlag, (unsigned)t);
+            for(k = 0u; k < 10u; k++){
+                USART3_SendByte(' ');
+                cp_put_hex8(Serial_RxPacket[k]);
+            }
+            USART3_SendString("\r\n");
+            USART3_SendString("[CARPUT]   正常应该是: 06 36 00 xx xx xx xx 6B\r\n");
+            USART3_SendString("[CARPUT]   全 00 / RxFlag=0  → 驱动器根本没用 0x36 应答\r\n");
+            break;
+        }
+
         case 'L':
             /* ★ 不重烧就进"升降电机单独测试"：只动地址 6，四个轮子和 K230 都不参与，
              *   正好用来隔离"下降堵转是不是别的负载/供电拖出来的"。 */
@@ -3978,7 +4057,7 @@ static void cp_host_cmd(char *line, char *label)
             lift_test_run();
             break;
         default:
-            USART3_SendString("[CARPUT] 命令: N 单步 B 回退 R 复位 S 状态 T 探针 D<n> 补偿 K<n> 单点 X 急停 L 升降单独测试\r\n");
+            USART3_SendString("[CARPUT] 命令: N 单步 B 回退 R 复位 S 状态 T 探针 D<n> 补偿 K<n> 单点 X 急停 L 升降测试 P 读位置原始包\r\n");
             USART3_Printf("[CARPUT] 流程: 正向 %u 步，之后按栈逆序恢复\r\n",
                           (unsigned)CP_STEP_COUNT);
             break;
@@ -4392,6 +4471,44 @@ static void lt_host_cmd(char *line)
             break;
 
         case 'W':
+            /* ★ 把**当前位置**设成驱动器零点（Emm42 的 0x93 0x88）。
+             *   用法：先用 ↓ 一点点降到你要当"0"的地方，再发 W。
+             *   之后 G<数字> 才是"离这里多少脉冲"。 */
+            lift_motor_set_zero();
+            USART3_SendString("[LIFT] 已把当前位置设为驱动器零点（0x93 0x88）\r\n");
+            USART3_SendString("[LIFT]   现在 cmd=0；之后 G<pos> 都从这点算\r\n");
+            lt_fault = 0u;                 /* 设完零点顺手清故障锁 */
+            break;
+
+        case 'P':
+        {
+            /* ★ 抓 0x36 的原始回包：判断"驱动器到底答不答"、答几个字节、格式对不对 */
+            uint8_t  k;
+            uint16_t t;
+
+            USART3_SendString("[LIFT] 发 0x36，抓原始回包（最多等 300 ms）…\r\n");
+            Serial_RxFlag = 0;
+            Serial_SendByte(LIFT_MOTOR_ADDR);
+            Serial_SendByte(0x36);
+            Serial_SendByte(0x6B);
+
+            for(t = 0u; t < 300u; t++){
+                if(Serial_RxFlag != 0) break;
+                Delay_ms(1);
+            }
+
+            USART3_Printf("[LIFT] RxFlag=%u 等了%ums raw =",
+                          (unsigned)Serial_RxFlag, (unsigned)t);
+            for(k = 0u; k < 10u; k++){
+                USART3_SendByte(' ');
+                cp_put_hex8(Serial_RxPacket[k]);
+            }
+            USART3_SendString("\r\n");
+            USART3_SendString("[LIFT]   正常应是 06 36 00 xx xx xx xx 6B；全 00 或 RxFlag=0 = 驱动器不答\r\n");
+            break;
+        }
+
+        case 'E':
         {
             /* ★ 分段下降到 0：每段 500 脉冲，段间停 300 ms，每段都读回位置。
              *   堵转时**最后打印的那一段**就是堵转高度：
@@ -4414,10 +4531,9 @@ static void lt_host_cmd(char *line)
 
         case 'H':
         default:
-            USART3_SendString("[LIFT] U<step> D<step> G<pos> Z S X C R<rel> H\r\n");
-            USART3_SendString("[LIFT]   U/D 相对步进  G 绝对位置  Z 回零  S 查状态\r\n");
-            USART3_SendString("[LIFT]   X 急停  C 清故障  R 相对帧移动(对比用)\r\n");
-            USART3_SendString("[LIFT]   V<rpm> 速度覆盖  A<accel> 加速度档  W 分段下降到 0\r\n");
+            USART3_SendString("[LIFT] 移动: U<步> D<步> G<绝对位置> Z(回零) E(分段下降到0)\r\n");
+            USART3_SendString("[LIFT] 零点: W(把当前位置设为0)  查询: S 状态  P 0x36原始包\r\n");
+            USART3_SendString("[LIFT] 参数: V<rpm> 速度  A<accel> 加速度档  其他: X 急停 C 清故障 R 相对\r\n");
             break;
     }
 
@@ -4450,8 +4566,8 @@ static void lift_test_run(void)
                   (unsigned)LIFT_MOTOR_SPEED, (unsigned)LIFT_MOTOR_SPEED_DOWN,
                   (unsigned)LIFT_MOTOR_ACCEL, (unsigned)LIFT_MOTOR_MAX);
     USART3_SendString("[LIFT] 板载按键: PC2=上升 PC3=下降 PC0=回零 PB1=换步长 PA7=读位置 PA5=急停\r\n");
-    USART3_SendString("[LIFT] 上位机: U<步> D<步> G<位置> Z 回零 S 状态 X 急停 C 清故障\r\n");
-    USART3_SendString("[LIFT]         V<rpm> 改速度  A<accel> 改加速度档  W 分段下降到 0\r\n");
+    USART3_SendString("[LIFT] 上位机: U<步> D<步> G<位置> Z 回零 W 设零点 P 原始包 E 分段下降到 0\r\n");
+    USART3_SendString("[LIFT]         S 状态 X 急停 C 清故障 V<rpm> 速度 A<accel> 加速度档 H 帮助\r\n");
     USART3_SendString("[LIFT] 每次移动后都会校验 ACT 和命令位置，差超过 600 脉冲就急停并锁定\r\n");
 
     /* 上电先读一次驱动器实际位置：

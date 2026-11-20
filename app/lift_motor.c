@@ -76,14 +76,42 @@ uint8_t lift_motor_soft_split(uint32_t from, uint32_t to, uint32_t *mid)
  * ========================================================================== */
 void lift_motor_move(uint32_t abs_pulses, uint8_t dir)
 {
-    uint8_t speed;
+    uint32_t delta;
 
     (void)dir;
 
-    /* 方向按目标与当前位置的关系定（绝对模式下一般被忽略，填对无害） */
-    speed = (abs_pulses >= g_lift_target) ? (uint8_t)LIFT_MOTOR_SPEED
-                                          : (uint8_t)LIFT_MOTOR_SPEED_DOWN;
-    lift_motor_move_at(abs_pulses, speed);
+    if (abs_pulses > LIFT_MOTOR_MAX) abs_pulses = LIFT_MOTOR_MAX;
+
+    if (abs_pulses == g_lift_target) return;          /* 已经在目标上，不发命令 */
+
+#if LIFT_USE_REL_FRAME
+    /* ★★ 2026-11-21 现场定案：脉冲字段这个驱动器当**相对量**用 ★★
+     *   证据：一直点"↑"每次只升一点点（发 100 走 100，发 200 又走 200…），
+     *         而一点"↓"就按发出去的"目标坐标"当行程走了一大段，直接撞底。
+     *   所以这里统一换算成差值：cmd[6..9] = |目标 − 当前|，cmd[10] = 0x00（相对），
+     *   cmd[2] = 方向（目标>当前 → 0x01 向上，否则 0x00 向下）。
+     *   这样"要走到哪"变成"要走多少"，不依赖驱动器的绝对定位模式。 */
+    if (abs_pulses > g_lift_target)
+    {
+        delta = abs_pulses - g_lift_target;
+        lift_motor_move_rel(delta, 0x01u);            /* 向上 */
+    }
+    else
+    {
+        delta = g_lift_target - abs_pulses;
+        lift_motor_move_rel(delta, 0x00u);            /* 向下 */
+    }
+
+    g_lift_target = abs_pulses;                       /* 自己记着走到哪了 */
+    return;
+#else
+    /* 上升 / 原地：照旧用绝对位置帧（老行为，只用来对比） */
+    {
+        uint8_t speed = (abs_pulses >= g_lift_target) ? (uint8_t)LIFT_MOTOR_SPEED
+                                                      : (uint8_t)LIFT_MOTOR_SPEED_DOWN;
+        lift_motor_move_at(abs_pulses, speed);
+    }
+#endif
 }
 
 /* 用指定速度走到绝对位置（绝对位置帧 + byte[10]=0x01） */
@@ -149,26 +177,40 @@ void lift_motor_stop(void)
     Delay_ms(5);
 }
 
-/* 相对位置帧（byte[10] = 0x00）。
- * 只用来做一次对比实验：如果相对帧的行程和绝对帧不一样，
- * 说明驱动器根本没在做绝对定位 —— 那"下降到 4000 却一路到底"就能解释了。
- * 注意：这里不更新 g_lift_target（相对移动之后我们不知道自己在哪了）。 */
+/* 相对位置帧（byte[10] = 0x00，脉冲字段 = **要走多少**）。
+ *
+ * ★ 2026-11-21 起，**下降**就走这条路（见 lift_motor_move 里的 LIFT_DESCEND_REL），
+ *   因为现场证明驱动器对"绝对位置 + 向下"处理不对：给个小目标它走一大段。
+ *   相对帧的语义最直白："朝这个方向走 N 个脉冲"，不依赖绝对定位模式。
+ *
+ * ★ 速度：向上用 LIFT_MOTOR_SPEED、向下用 LIFT_MOTOR_SPEED_DOWN，
+ *   再让运行期覆盖（V 命令）和加速度覆盖（A 命令）生效 —— 以前这里写死了默认值，
+ *   所以在模式 13 里改速度对 R 命令不起作用。
+ *
+ * 注意：这里**不更新** g_lift_target —— 由调用者决定（lift_motor_move 会更新）。 */
 void lift_motor_move_rel(uint32_t pulses, uint8_t dir)
 {
+    uint8_t speed = dir ? (uint8_t)LIFT_MOTOR_SPEED : (uint8_t)LIFT_MOTOR_SPEED_DOWN;
+
     uint8_t cmd[13] = {
         LIFT_MOTOR_ADDR,
         0xFD,                                            /* 位置模式 */
         dir,
-        (uint8_t)(LIFT_MOTOR_SPEED >> 8),
-        (uint8_t)(LIFT_MOTOR_SPEED & 0xFFu),
-        (uint8_t)LIFT_MOTOR_ACCEL,
-        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,                                      /* 速度，下面填 */
+        0x00,                                            /* 加速度，下面填 */
+        0x00, 0x00, 0x00, 0x00,                          /* 脉冲数，下面填 */
         0x00,                                            /* ★ 相对位置 */
         0x00,                                            /* 立即执行 */
         0x6B
     };
 
     if(pulses > LIFT_MOTOR_MAX) pulses = LIFT_MOTOR_MAX;
+
+    if (g_lift_speed_ovr != 0u) speed = g_lift_speed_ovr;
+
+    cmd[3] = (uint8_t)(speed >> 8);
+    cmd[4] = (uint8_t)(speed & 0xFFu);
+    cmd[5] = g_lift_accel_now;
 
     cmd[6] = (uint8_t)(pulses >> 24);
     cmd[7] = (uint8_t)(pulses >> 16);
@@ -203,36 +245,59 @@ void lift_motor_sync(void)
  * 发送：[6][0x36][0x6B]                    3 字节
  * 回包：[6][0x36][符号][位置 B3..B0][0x6B] 8 字节
  *   符号 0x00 = 正，0x01 = 负（说明驱动器认为自己在零点下面 —— 正是要抓的现象）
+ *
+ * ★ 2026-11-21 现场：这个方法一直返回失败（日志里 ACT=-9999），
+ *   也就是**完全没有位置反馈**，后果是：
+ *     - lift_motor_sync() 每次都空转，永远不会纠正"我们以为的位置"
+ *     - 下降时不管机械丢步多少、降过头多少，代码都看不见、也不会补偿
+ *     - CP_FLOOR_GUARD 这道机械底防呆形同虚设
+ *   所以这里加了两条：
+ *     ① 重发最多 3 次（总线是 6 个驱动器共用，回包容易被别的帧挤掉）
+ *     ② 收到"不是 0x36 的包"（比如别的电机对移动命令回的 0x3A）时**丢掉继续等**，
+ *        而不是像以前那样直接判失败
  * ========================================================================== */
 uint8_t lift_motor_read_pos(int32_t *out)
 {
     uint32_t timeout;
     uint32_t p;
     uint8_t  sign;
+    uint8_t  attempt;
 
-    Serial_SendByte(LIFT_MOTOR_ADDR);
-    Serial_SendByte(0x36);
-    Serial_SendByte(0x6B);
+    for (attempt = 0u; attempt < 3u; attempt++)
+    {
+        Serial_RxFlag = 0;
 
-    Serial_RxFlag = 0;
-    timeout = 200000u;
-    while ((Serial_RxFlag == 0) && (timeout > 0u)) timeout--;
+        Serial_SendByte(LIFT_MOTOR_ADDR);
+        Serial_SendByte(0x36);
+        Serial_SendByte(0x6B);
 
-    if (Serial_RxFlag == 0) return 0u;
-    if (Serial_RxPacket[0] != LIFT_MOTOR_ADDR) return 0u;
-    if (Serial_RxPacket[1] != 0x36)            return 0u;
-    if (Serial_RxPacket[7] != 0x6B)            return 0u;
+        timeout = 200000u;
+        while (timeout > 0u)
+        {
+            if (Serial_RxFlag != 0)
+            {
+                Serial_RxFlag = 0;
 
-    sign = Serial_RxPacket[2];
-    p = ((uint32_t)Serial_RxPacket[3] << 24) |
-        ((uint32_t)Serial_RxPacket[4] << 16) |
-        ((uint32_t)Serial_RxPacket[5] << 8)  |
-        ((uint32_t)Serial_RxPacket[6]);
+                if ((Serial_RxPacket[0] == LIFT_MOTOR_ADDR) &&
+                    (Serial_RxPacket[1] == 0x36)           &&
+                    (Serial_RxPacket[7] == 0x6B))
+                {
+                    sign = Serial_RxPacket[2];
+                    p = ((uint32_t)Serial_RxPacket[3] << 24) |
+                        ((uint32_t)Serial_RxPacket[4] << 16) |
+                        ((uint32_t)Serial_RxPacket[5] << 8)  |
+                        ((uint32_t)Serial_RxPacket[6]);
 
-    if (out != 0) *out = (sign == 0x01u) ? -(int32_t)p : (int32_t)p;
+                    if (out != 0) *out = (sign == 0x01u) ? -(int32_t)p : (int32_t)p;
+                    return 1u;
+                }
+                /* 不是 0x36 的回包（别的电机的 0x3A 等）→ 丢掉，继续等这一帧 */
+            }
+            timeout--;
+        }
+    }
 
-    Serial_RxFlag = 0;
-    return 1u;
+    return 0u;
 }
 
 /* 十六进制打印一个字节（USART3_Printf 不带 %X，自己拼） */
