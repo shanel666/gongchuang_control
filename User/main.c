@@ -3002,6 +3002,10 @@ static void servo_test_run(void)
  *   上一动作还在走就可以直接按下一次。
  *     1 = 不等（★当前）
  *     0 = 老行为：等估算时间走完再返回（模式 12 里基本用不到了） */
+/* ★ 手动（PC3 / PB1 / 上位机 N）时**不等到位**，命令发出去就返回，
+ *   上一条还在走也能直接按下一条 —— 到没到位由人眼判断（现场要求）。
+ *   自主模式（PC2）不看这个宏，它内部把 g_cp_wait_mode 置 1，每步都等。
+ *   这个宏只是留个记录：手动默认就是 1（不等）。 */
 #define CP_STEP_NO_WAIT    1u
 
 /* ★ 视觉那一步结束（按 PC3 确认对准）时，要不要**顺手把下一个动作也做掉**。
@@ -3057,7 +3061,10 @@ static void servo_test_run(void)
 #define CP_VISION_NO_DATA_BAIL  0u
 #define CP_VISION_NO_DATA_MS    3000u
 #define CP_VISION_STABLE       3u       /* （保留，内部已改用 SETTLE） */
-#define CP_VISION_SETTLE       0u       /* 0 = 不自动收工（只认 PC3）；>0 = 连续这么多帧稳在死区就收工 */
+#define CP_VISION_SETTLE       0u       /* 已废弃：现在用运行期的 g_cp_vision_need 控制 */
+/* ★ 自主模式（PC2）下，K230 连续这么多帧都稳住就算标定完成，自动往下走。
+ *   现场定的次数 = 3 次（10 Hz 回包，约 0.3 秒确认一次）。 */
+#define CP_VISION_AUTO_SETTLE  3u
 #define CP_VISION_RESEND_MS    2000u    /* K230 静默多久重发一次 circle */
 #define CP_VISION_RETRY_MAX    5u
 /* 对准超时/失败时：1 = 打个大红警告继续往下走；0 = 让这一步失败停住。
@@ -3119,6 +3126,18 @@ static uint8_t    g_cp_undo_done  = 0u;
 
 /* ★ 下降补偿的当前值（脉冲）。上电 = CP_DESCEND_TRIM，串口 D<n> 可现场改。 */
 static uint32_t   g_cp_descend_trim = CP_DESCEND_TRIM;
+
+/* ★ 运行方式（2026-11-21 加）：
+ *     PC3 = 手动，一按一个动作，**不等到位**（g_cp_wait_mode = 0）
+ *     PC2 = 自主走一遍，**每步等都走完**（g_cp_wait_mode = 1）
+ *   为什么自动必须等：现在是"走多少"的指令，不等它走完就发下一条，
+ *   行程会从"我以为的位置"算起，越走越偏。 */
+static uint8_t    g_cp_wait_mode = 0u;
+
+/* ★ 视觉这一步要连续多少帧稳住才算"标定完成"：
+ *     0 = 不收工，只能按 PC3 结束（手动模式）
+ *     3 = 连续 3 帧进死区就自动收工（自主模式，见 CP_VISION_AUTO_SETTLE） */
+static uint8_t    g_cp_vision_need = 0u;
 
 /* 把"表里写的目标绝对位置"换算成"这次真正要发的位置"。
  *   只在**下降**（目标比当前低）时把目标抬高 trim 个脉冲 —— 就是"降少一点"；
@@ -3249,16 +3268,12 @@ static uint8_t cp_vision_align(void)
     K230_SendLine(K230_CMD_CIRCLE);
     USART3_Printf("[CARPUT] TX circle  目标点=(%d,%d)  死区=±%d px\r\n",
                   VISION_TARGET_X, VISION_TARGET_Y, VISION_DEADBAND_PX);
-    USART3_SendString("[CARPUT] 底盘会自动一步步修正；**对准了就再按一次 PC3**\r\n");
-#if CP_VISION_SETTLE > 0
-    USART3_Printf("[CARPUT] 另外：连续 %u 帧进死区也会自动收工\r\n",
-                  (unsigned)CP_VISION_SETTLE);
-#else
-    USART3_SendString("[CARPUT] 不做自动收工、不超时 —— 只有 PC3 能结束这一步\r\n");
-#endif
-#if CP_VISION_MAX_MS > 0
-    USART3_Printf("[CARPUT] 最长等 %u ms\r\n", (unsigned)CP_VISION_MAX_MS);
-#endif
+    if(g_cp_vision_need != 0u){
+        USART3_Printf("[CARPUT] 自主模式：连续 %u 帧稳住就自动往下走（也可按 PC3 提前结束）\r\n",
+                      (unsigned)g_cp_vision_need);
+    }else{
+        USART3_SendString("[CARPUT] 手动模式：底盘自动修正，**对准了就再按一次 PC3**\r\n");
+    }
     USART3_SendString("[CARPUT] PA5 = 中止整段\r\n");
 
     while((max_ms == 0u) || (t_ms < max_ms))
@@ -3312,29 +3327,28 @@ static uint8_t cp_vision_align(void)
 
             if(need == 0u){
                 if(steady < 255u) steady++;
-#if CP_VISION_SETTLE > 0
-                USART3_Printf("[CARPUT]   帧%u C(%d,%d) 稳住 %u/%u\r\n",
-                              (unsigned)frames, (int)K230_Cx, (int)K230_Cy,
-                              (unsigned)steady, (unsigned)CP_VISION_SETTLE);
-#else
-                /* 不自动收工：只报"在当前死区里"，收工由 PC3 决定 */
-                USART3_Printf("[CARPUT]   帧%u C(%d,%d) d=(%d,%d) 已在死区（连续 %u 帧）\r\n",
-                              (unsigned)frames, (int)K230_Cx, (int)K230_Cy,
-                              (int)(has_prev ? ((int16_t)K230_Cx - prev_cx) : 0),
-                              (int)(has_prev ? ((int16_t)K230_Cy - prev_cy) : 0),
-                              (unsigned)steady);
-#endif
 
-#if CP_VISION_SETTLE > 0
-                if(steady >= CP_VISION_SETTLE){
-                    vision_stop_all();
-                    K230_SendLine(K230_CMD_STOP);
-                    USART3_Printf("[CARPUT] ✅ 对准完成（自动收工）C(%d,%d)  %u 帧 / %u 步修正\r\n",
-                                  (int)K230_Cx, (int)K230_Cy,
-                                  (unsigned)frames, (unsigned)moves);
-                    return 1u;
+                if(g_cp_vision_need != 0u){
+                    USART3_Printf("[CARPUT]   帧%u C(%d,%d) 稳住 %u/%u\r\n",
+                                  (unsigned)frames, (int)K230_Cx, (int)K230_Cy,
+                                  (unsigned)steady, (unsigned)g_cp_vision_need);
+                    if(steady >= g_cp_vision_need){
+                        vision_stop_all();
+                        K230_SendLine(K230_CMD_STOP);
+                        USART3_Printf("[CARPUT] ✅ 标定完成（连续 %u 帧稳住）C(%d,%d)  %u 帧 / %u 步修正\r\n",
+                                      (unsigned)g_cp_vision_need,
+                                      (int)K230_Cx, (int)K230_Cy,
+                                      (unsigned)frames, (unsigned)moves);
+                        return 1u;
+                    }
+                }else{
+                    /* 手动：不自动收工，只报"在当前死区里"，收工由 PC3 决定 */
+                    USART3_Printf("[CARPUT]   帧%u C(%d,%d) d=(%d,%d) 已在死区（连续 %u 帧）\r\n",
+                                  (unsigned)frames, (int)K230_Cx, (int)K230_Cy,
+                                  (int)(has_prev ? ((int16_t)K230_Cx - prev_cx) : 0),
+                                  (int)(has_prev ? ((int16_t)K230_Cy - prev_cy) : 0),
+                                  (unsigned)steady);
                 }
-#endif
             }else{
                 steady = 0u;
                 moves++;
@@ -3430,17 +3444,14 @@ static uint8_t cp_vision_align(void)
 static uint8_t cp_apply(const CarPutStep *s)
 {
     uint32_t aim;
-#if !CP_STEP_NO_WAIT
     uint16_t ms;
-#endif
 
     if(s->kind == CP_KIND_SERVO){
         Servo_SetAngle((ServoId)s->id, s->deg);
-#if CP_STEP_NO_WAIT
-        return 1u;                       /* ★ 不等舵机到位，人眼看着按下一键 */
-#else
-        return grab_wait(CP_SERVO_SETTLE_MS);
-#endif
+        if(g_cp_wait_mode == 0u){
+            return 1u;                   /* 手动：不等舵机到位，人眼看着按下一键 */
+        }
+        return grab_wait(CP_SERVO_SETTLE_MS);   /* 自动：等舵机走完 */
     }
 
     if(s->kind == CP_KIND_VISION){
@@ -3481,43 +3492,16 @@ static uint8_t cp_apply(const CarPutStep *s)
         }
     }
 
-#if CP_STEP_NO_WAIT
-    /* ★ 只把命令发出去就返回：上一条还在走也可以直接按下一条，
-     *   到没到位由人眼判断（现场要求）。速度/加速度仍按下面这套默认值。 */
-    lift_motor_move(aim, (aim > g_lift_target) ? 0x01u : 0x00u);
-    return 1u;
-#else
-
-#if CP_LIFT_SOFT_LANDING
-    {
-        uint32_t mid;
-
-        /* 长距离下降走两段：先下降速度到 目标+SOFT_ZONE，再爬行速度收最后一段。 */
-        if(lift_motor_soft_split(g_lift_target, aim, &mid))
-        {
-            ms = lift_motor_ms_for(g_lift_target, mid, (uint8_t)LIFT_MOTOR_SPEED_DOWN);
-            USART3_Printf("[CARPUT]     ① 先到 %u（%u RPM，等 %u ms）\r\n",
-                          (unsigned)mid, (unsigned)LIFT_MOTOR_SPEED_DOWN, (unsigned)ms);
-            lift_motor_move_at(mid, (uint8_t)LIFT_MOTOR_SPEED_DOWN);
-            if(!cp_lift_wait_guarded(ms)){ lift_motor_stop(); return 0u; }
-
-            Delay_ms(150);
-
-            ms = lift_motor_ms_for(mid, aim, (uint8_t)LIFT_MOTOR_SPEED_CREEP);
-            USART3_Printf("[CARPUT]     ② 爬行到 %u（%u RPM，等 %u ms）\r\n",
-                          (unsigned)aim, (unsigned)LIFT_MOTOR_SPEED_CREEP, (unsigned)ms);
-            lift_motor_move_at(aim, (uint8_t)LIFT_MOTOR_SPEED_CREEP);
-            if(!cp_lift_wait_guarded(ms)){ lift_motor_stop(); return 0u; }
-
-            Delay_ms(200);
-            return 1u;
-        }
+    if(g_cp_wait_mode == 0u){
+        /* ★ 手动：只把命令发出去就返回（上一条还在走也能直接按下一条），
+         *   到没到位由人眼判断。 */
+        lift_motor_move(aim, (aim > g_lift_target) ? 0x01u : 0x00u);
+        return 1u;
     }
-#endif
 
-    /* 一段走到底（CP_LIFT_SOFT_LANDING=0 时走这里，排查堵转用） */
+    /* ★ 自动（PC2）：发命令 + 等到位，带堵转检测，堵了就急停并中止整套 */
     ms = lift_motor_move_ms(g_lift_target, aim);
-    USART3_Printf("[CARPUT]     一段到底（等 %u ms）\r\n", (unsigned)ms);
+    USART3_Printf("[CARPUT]     等它走完（约 %u ms）\r\n", (unsigned)ms);
     lift_motor_move(aim, (aim > g_lift_target) ? 0x01u : 0x00u);
     if(!cp_lift_wait_guarded(ms)){
         lift_motor_stop();               /* 中止：补一帧急停，别让它继续走完 */
@@ -3526,7 +3510,6 @@ static uint8_t cp_apply(const CarPutStep *s)
 
     Delay_ms(200);                       /* 等停稳再让下一步动舵机 */
     return 1u;
-#endif  /* CP_STEP_NO_WAIT */
 }
 
 /* 把"回到执行前状态"的反向动作压栈
@@ -3813,6 +3796,10 @@ static uint8_t cp_auto_sequence(char *label)
     uint8_t ok  = 1u;
     uint8_t vis = cp_vision_index();
 
+    /* 手动单步：不等到位、视觉只认 PC3 */
+    g_cp_wait_mode   = 0u;
+    g_cp_vision_need = 0u;
+
     if(g_cp_phase == CP_PH_DONE) cp_reset_state();         /* 上一轮做完了，重新开始 */
     if(g_cp_phase == CP_PH_UNDO) g_cp_phase = CP_PH_FWD;   /* 从"回退"切回"前进" */
 
@@ -3860,12 +3847,66 @@ static uint8_t cp_auto_sequence(char *label)
 }
 
 /* ============================================================================
+ * ★ PC2：自主走一遍（从当前状态自动跑完剩下的所有动作）
+ * ----------------------------------------------------------------------------
+ * 和 PC3 手动单步只差两点：
+ *   ① g_cp_wait_mode = 1 → **每个动作都等它走完**再发下一条。
+ *      必须等：现在是"走多少"的指令，不等就发下一条，行程会从"我以为的位置"
+ *      算起，越走越偏。
+ *   ② g_cp_vision_need = CP_VISION_AUTO_SETTLE(3) → K230 连续 3 帧稳住
+ *      就认为标定完成，自动往下走，不用再按 PC3。
+ *
+ * 出口：PA5 = 中止整段（会补急停帧）；
+ *       视觉那一步想提前结束也可以按 PC3。
+ * 起点：如果已经手动走了几步，就从下一步开始接着走。
+ * ========================================================================== */
+static uint8_t cp_run_auto(char *label)
+{
+    uint8_t ok = 1u;
+
+    if(g_cp_phase == CP_PH_DONE) cp_reset_state();         /* 上一轮做完了，从头来 */
+    if(g_cp_phase == CP_PH_UNDO) g_cp_phase = CP_PH_FWD;   /* 从"回退"切回"前进" */
+
+    g_cp_wait_mode   = 1u;
+    g_cp_vision_need = (uint8_t)CP_VISION_AUTO_SETTLE;
+
+    USART3_SendString("\r\n[CARPUT] ===== 自主走一遍（PC2）=====\r\n");
+    USART3_Printf("[CARPUT] 共 %u 个动作（从第 %u 个开始），每步等它走完\r\n",
+                  (unsigned)CP_STEP_COUNT, (unsigned)(g_cp_fwd + 1u));
+    USART3_Printf("[CARPUT] K230 连续 %u 帧稳住就自动继续；PA5 中止\r\n",
+                  (unsigned)g_cp_vision_need);
+
+    while(g_cp_fwd < CP_STEP_COUNT)
+    {
+        USART3_Printf("[CARPUT] 动作 %u/%u：%s\r\n",
+                      (unsigned)(g_cp_fwd + 1u), (unsigned)CP_STEP_COUNT,
+                      k_cp_steps[g_cp_fwd].label);
+
+        if(!cp_do_step(label)){ ok = 0u; break; }
+    }
+
+    g_cp_wait_mode   = 0u;                                 /* 结束后恢复手动语义 */
+    g_cp_vision_need = 0u;
+
+    if(ok){
+        g_cp_phase = CP_PH_DONE;
+        USART3_SendString("[CARPUT] ✅ 自主流程完成，停在这个姿态\r\n");
+        USART3_SendString("[CARPUT]    再来一轮：直接按 PC2（或先 PC0 复位再从 PC3 单步）\r\n");
+    }else{
+        USART3_SendString("[CARPUT] ❌ 自主流程中止（PA5 / 堵转），停在原地\r\n");
+        USART3_SendString("[CARPUT]    排查完按 PC3 从这一步继续，或 PC0 复位重来\r\n");
+    }
+
+    cp_show(label);
+    return ok;
+}
+
+/* ============================================================================
  * ★ 关于「连跑 A」：已经停用
  * ----------------------------------------------------------------------------
- * 现在每个动作都是"发完命令立刻返回、不等到位"（CP_STEP_NO_WAIT=1）。
- * 如果还保留连跑，一条 A 命令会把 11 个动作在几毫秒内全发出去 ——
- * 机械臂还在原地，就要它同时"转 163°+降 1000+夹紧"，非常危险。
- * 所以 'A' 现在只提示一句，不再执行。要连跑请在 CP_STEP_NO_WAIT=0 时再用。
+ * 上位机的 A 命令会把动作在几毫秒内全发出去 —— 机械臂还在原地就要它同时
+ * "转 163°+降 1000+夹紧"，非常危险。所以 'A' 只提示一句。
+ * 要自动跑请用**板载 PC2**（它会每一步都等到位）。
  * ========================================================================== */
 
 /* 弹栈一步（逆序回退） */
@@ -3926,7 +3967,7 @@ static void cp_host_cmd(char *line, char *label)
     {
         case 'N': cp_do_step(label);   break;         /* next 单步 */
         case 'A':                                      /* all 连跑：现在已停用 */
-            USART3_SendString("[CARPUT] 连跑 A 已停用（每按一次只做一个动作，用 N 或 PC3）\r\n");
+            USART3_SendString("[CARPUT] 连跑 A 已停用 —— 要自动跑请按板载 PC2（会每步等到位）\r\n");
             break;
         case 'B': cp_step_back(label); break;         /* back 回退一步 */
         case 'R':                                      /* reset 内部状态 */
@@ -4079,9 +4120,9 @@ static void car_put_run(void)
     OLED_Clear();
     strcpy(label, "READY");
     cp_show(label);
-    OLED_ShowString(4, 1, "PC3=NEXT PC0=RST");
+    OLED_ShowString(4, 1, "PC2=AUTO PC3=NEXT");
 
-    USART3_SendString("\r\n[CARPUT] 从车上取料 → 放地上（★ 每按一次 PC3 = 一个动作，不等到位）\r\n");
+    USART3_SendString("\r\n[CARPUT] 从车上取料 → 放地上（PC2=自主走一遍 / PC3=一按一个动作）\r\n");
     USART3_Printf("[CARPUT] 正向 %u 个动作\r\n", (unsigned)CP_STEP_COUNT);
     USART3_Printf("[CARPUT] 升降步进(绝对): 高位 %u / 抓料 %u / 零位 %u   下降补偿 %u 脉冲\r\n",
                   (unsigned)CP_MOT_HIGH, (unsigned)CP_MOT_GRAB, (unsigned)CP_MOT_HOME,
@@ -4090,10 +4131,12 @@ static void car_put_run(void)
                   (unsigned)CP_LIFT_UP_DEG, (unsigned)CP_LIFT_HOME);
     USART3_Printf("[CARPUT] 夹爪: 夹紧 %u° / 松开 %u°   旋转初始 %u°\r\n",
                   (unsigned)CP_GRIP_HOLD, (unsigned)CP_GRIP_HOME, (unsigned)CP_ROT_HOME);
-    USART3_SendString("[CARPUT] 升降步进按【绝对位置】发（byte10=0x01，脉冲字段=目标位置）\r\n");
-    USART3_SendString("[CARPUT] 板载: PC3=做下一个动作(视觉时=对准完成) PC2=同 PC0=复位 PA5=中止\r\n");
+    USART3_SendString("[CARPUT] 升降步进按【相对帧】发（脉冲字段=要走多少，byte10=0x00）\r\n");
+    USART3_SendString("[CARPUT] 板载: PC2=自主走一遍(全自动) PC3=下一个动作 PB1=下一个动作 PC0=复位 PA5=中止\r\n");
+    USART3_Printf("[CARPUT] 自主模式: K230 连续 %u 帧稳住自动继续；手动模式: 视觉那步等 PC3\r\n",
+                  (unsigned)CP_VISION_AUTO_SETTLE);
     USART3_SendString("[CARPUT] 上位机: N 单步/D<n> 补偿/T 探针/K<n> 单点/B 回退/R 复位/S 状态/X 急停/L 升降单独测试\r\n");
-    USART3_SendString("[CARPUT] 流程: PC3抬升 -> PC3开始识别+底盘修正 -> PC3确认并转163° -> 依次 舵机/步进/夹爪 …\r\n");
+    USART3_SendString("[CARPUT] 流程: 抬升 -> 识别圆+底盘修正 -> 转163° -> 抬臂 -> 降1000 -> 夹 -> 抬回7600 -> 转30° -> 回90° -> 降0 -> 松爪\r\n");
 
     while(1)
     {
@@ -4105,7 +4148,7 @@ static void car_put_run(void)
             continue;
         }
 
-        /* ---------- PC3：★ 半自动（抬升 → 识别圆 → 你按 PC3 → 夹取放料） ---------- */
+        /* ---------- PC3：手动，一按只做下一个动作（不等到位） ---------- */
         if((pc3_gap == 0u) && st_pc_held(GPIO_Pin_3)){
             uint16_t hold;
             pc3_gap = 400u;
@@ -4113,21 +4156,21 @@ static void car_put_run(void)
             /* 先等松手再开跑，免得"按住"被当成连按 */
             for(hold = 0u; st_pc_held(GPIO_Pin_3) && (hold < 200u); hold++) Delay_ms(10);
             cp_auto_sequence(label);
-            pc3_gap = 400u;          /* 半自动回来后屏蔽一段，防抖 */
+            pc3_gap = 400u;          /* 回来后屏蔽一段，防抖 */
             continue;
         }
 
-        /* ---------- PC2：单步（备用，一次只做一个动作；调试用） ---------- */
+        /* ---------- PC2：★ 自主走一遍（自动跑完剩下的动作） ---------- */
         if((pc2_gap == 0u) && st_pc_held(GPIO_Pin_2)){
             uint16_t hold;
             pc2_gap = 400u;
-            USART3_SendString("[CARPUT] --- PC2 单步（一次一个动作） ---\r\n");
-            cp_do_step(label);
             for(hold = 0u; st_pc_held(GPIO_Pin_2) && (hold < 200u); hold++) Delay_ms(10);
+            cp_run_auto(label);
+            pc2_gap = 400u;
             continue;
         }
 
-        /* ---------- PB1：连跑（和 PC3 一样是半自动，视觉处等 PC3） ---------- */
+        /* ---------- PB1：和 PC3 一样，手动做下一个动作 ---------- */
         if(grab_step_hit()){
             USART3_SendString("[CARPUT] --- PB1 下一个动作 ---\r\n");
             cp_auto_sequence(label);
