@@ -66,6 +66,25 @@ uint8_t lift_motor_soft_split(uint32_t from, uint32_t to, uint32_t *mid);
 /* 用指定速度走到绝对位置。lift_motor_move() 内部就是调它。 */
 void lift_motor_move_at(uint32_t abs_pulses, uint8_t speed_rpm);
 
+/* ============================================================================
+ * ★ 运行期覆盖「速度 / 加速度」—— 现场排查下降堵转专用
+ * ----------------------------------------------------------------------------
+ * 头文件里的 LIFT_MOTOR_SPEED / SPEED_DOWN / ACCEL 是编译期常量，改一次要重烧。
+ * 排查堵转时需要在同一套机械上连续试 20 / 15 / 12 / 8 / 5 RPM 和不同加速度档，
+ * 所以这里给一组运行期开关（只改 RAM，掉电恢复默认）：
+ *
+ *     lift_motor_set_speed_ovr(12);   // 之后所有位置移动都用 12 RPM
+ *     lift_motor_set_speed_ovr(0);    // 0 = 取消覆盖，回到"上升40/下降20"
+ *     lift_motor_set_accel(40);       // 加速度档，0 = 恢复默认 LIFT_MOTOR_ACCEL
+ *
+ * ★ 覆盖值同时作用于**时间估算**（lift_motor_ms_for），否则等待时间会和实际
+ *   动作对不上，位置校验会误判成"没走到"。
+ * ========================================================================== */
+void    lift_motor_set_speed_ovr(uint8_t rpm);
+uint8_t lift_motor_get_speed_ovr(void);
+void    lift_motor_set_accel(uint8_t accel);
+uint8_t lift_motor_get_accel(void);
+
 /* ★ 把**当前位置设为驱动器零点**（Emm42 的 0x93 0x88 指令）。
  *   用途：机械臂手动降到最低位后调一次，之后"0"就等于机械底，
  *         绝对位置不会再整体偏移。调用后 g_lift_target 归 0。 */

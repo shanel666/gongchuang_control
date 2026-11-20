@@ -12,6 +12,15 @@
  * 上电 = 0 = 机械最低位。外部调用都按绝对位置写，帧里也直接填绝对位置。 */
 uint32_t g_lift_target = LIFT_MOTOR_HOME;
 
+/* ★ 运行期覆盖（排查下降堵转用；0 = 不覆盖，按编译期常量走） */
+static uint8_t g_lift_speed_ovr = 0u;
+static uint8_t g_lift_accel_now = (uint8_t)LIFT_MOTOR_ACCEL;
+
+void lift_motor_set_speed_ovr(uint8_t rpm)  { g_lift_speed_ovr = rpm; }
+uint8_t lift_motor_get_speed_ovr(void)      { return g_lift_speed_ovr; }
+void lift_motor_set_accel(uint8_t accel)    { g_lift_accel_now = (accel == 0u) ? (uint8_t)LIFT_MOTOR_ACCEL : accel; }
+uint8_t lift_motor_get_accel(void)          { return g_lift_accel_now; }
+
 /* 按指定速度估算 from → to 要走多久（ms）。
  * 理论时间 = 脉冲数 ÷ (rpm × 3200 / 60)；这里再乘 1.25 留余量，加固定开销。 */
 uint16_t lift_motor_ms_for(uint32_t from, uint32_t to, uint8_t rpm)
@@ -21,6 +30,7 @@ uint16_t lift_motor_ms_for(uint32_t from, uint32_t to, uint8_t rpm)
     uint32_t ms;
 
     if (rpm == 0u) rpm = (uint8_t)LIFT_MOTOR_SPEED;
+    if (g_lift_speed_ovr != 0u) rpm = g_lift_speed_ovr;   /* 覆盖值同时影响时间估算 */
 
     /* 1000 脉冲 ÷ (rpm*3200/60) 秒 = 60000*1000/(rpm*3200) ms = 18750/rpm */
     per = 18750u / (uint32_t)rpm;
@@ -94,9 +104,12 @@ void lift_motor_move_at(uint32_t abs_pulses, uint8_t speed_rpm)
     /* 软限位 */
     if (abs_pulses > LIFT_MOTOR_MAX) abs_pulses = LIFT_MOTOR_MAX;
     if (speed_rpm == 0u) speed_rpm = (uint8_t)LIFT_MOTOR_SPEED;
+    if (g_lift_speed_ovr != 0u) speed_rpm = g_lift_speed_ovr;   /* ★ 排查堵转用的运行期覆盖 */
 
     /* 方向位按目标与当前位置的关系填 */
     cmd[2] = (abs_pulses >= g_lift_target) ? 0x01u : 0x00u;
+
+    cmd[5] = g_lift_accel_now;                                  /* ★ 加速度档也可运行期改 */
 
     cmd[3] = (uint8_t)(speed_rpm >> 8);
     cmd[4] = (uint8_t)(speed_rpm & 0xFFu);
