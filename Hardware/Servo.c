@@ -2,40 +2,48 @@
 #include "Servo.h"
 
 /*
- * PA0 / PA1 的定时器复用关系：
- *   TIM2_CH1/CH2/CH3/CH4 默认就在 PA0/PA1/PA2/PA3（不需要重映射），
- *   本工程只用 CH1/CH2 → PA0（夹爪）、PA1（旋转）。
+ * PC7 / PC8 / PC9 的定时器复用关系：
+ *   TIM3_CH1/CH2/CH3/CH4 默认在 PA6/PA7/PB0/PB1，
+ *   **完全重映射** 后为 PC6/PC7/PC8/PC9，所以：
+ *     PC7 = TIM3_CH2（升降）
+ *     PC8 = TIM3_CH3（夹爪）
+ *     PC9 = TIM3_CH4（旋转）
  *
- * ★ PA2（TIM2_CH3）已弃用：实测该引脚输出异常（把舵机信号线挪到 PA1 就正常），
- *   可能是芯片这一脚损坏，所以旋转舵机也从 PA2 改到 PA1，夹爪改到 PA0。
- *   如果以后想换脚，只改 SERVO_GPIO_PIN 和 k_servo_ch 两处即可。
+ * ★ 注意：这是"完全重映射"（GPIO_FullRemap_TIM3），不要和"部分重映射"混了：
+ *     部分重映射 CH1=PB4 CH2=PB5，CH3/CH4 仍在 PB0/PB1（不是 PC8/PC9）；
+ *     完全重映射 CH1=PC6 CH2=PC7 CH3=PC8 CH4=PC9  ← 我们要的是这个。
+ *   顺带好处：完全重映射把 CH1/CH2 从 PA6/PA7 挪走，PA7 可以安心当按键。
  *
- * 时基：TIM2 时钟 72 MHz，预分频 72 -> 计数频率 1 MHz（1 个计数 = 1 us），
+ * 时基：TIM3 时钟 72 MHz，预分频 72 -> 计数频率 1 MHz（1 个计数 = 1 us），
  *       ARR = 20000 - 1 -> 周期 20 ms（50 Hz），CCR 即高电平脉宽 us 数。
+ *
+ * 历史：换 C8T6 时（LQFP48 没有 PC7/PC8/PC9）曾临时改用 PA0/PA1 + TIM2；
+ *       现在换回 RCT6，恢复 PC7/PC8/PC9 三路。
  */
 
-#define SERVO_TIM           TIM2
-#define SERVO_TIM_CLK       RCC_APB1Periph_TIM2
-#define SERVO_GPIO_CLK      RCC_APB2Periph_GPIOA
-#define SERVO_GPIO_PORT     GPIOA
-#define SERVO_GPIO_PIN      (GPIO_Pin_0 | GPIO_Pin_1)   /* PA0=夹爪、PA1=旋转（PA2 弃用） */
+#define SERVO_TIM           TIM3
+#define SERVO_TIM_CLK       RCC_APB1Periph_TIM3
+#define SERVO_GPIO_CLK      RCC_APB2Periph_GPIOC
+#define SERVO_GPIO_PORT     GPIOC
+#define SERVO_GPIO_PIN      (GPIO_Pin_7 | GPIO_Pin_8 | GPIO_Pin_9)   /* PC7=升降、PC8=夹爪、PC9=旋转 */
 
 #define SERVO_PERIOD_US     20000u  /* 20 ms */
 #define SERVO_TIM_PSC       (72u - 1u)
 
 /* 每路舵机：定时器通道、上电角度、角度微调（下标就是 ServoId）
- *   SERVO_ROT  = PA1 / TIM2_CH2
- *   SERVO_GRIP = PA0 / TIM2_CH1 */
-static const uint8_t  k_servo_ch[SERVO_COUNT]   = {2u, 1u};
+ *   SERVO_ROT  = PC9 / TIM3_CH4
+ *   SERVO_GRIP = PC8 / TIM3_CH3
+ *   SERVO_LIFT = PC7 / TIM3_CH2 */
+static const uint8_t  k_servo_ch[SERVO_COUNT]   = {4u, 3u, 2u};
 static const uint16_t k_servo_init[SERVO_COUNT] = {
-    SERVO_ROT_INIT_DEG, SERVO_GRIP_INIT_DEG
+    SERVO_ROT_INIT_DEG, SERVO_GRIP_INIT_DEG, SERVO_LIFT_INIT_DEG
 };
 static const int16_t  k_servo_trim[SERVO_COUNT] = {
-    SERVO_TRIM_ROT, SERVO_TRIM_GRIP
+    SERVO_TRIM_ROT, SERVO_TRIM_GRIP, SERVO_TRIM_LIFT
 };
 /* 方向取反标志（见 Servo.h 里的说明） */
 static const uint8_t  k_servo_invert[SERVO_COUNT] = {
-    SERVO_INVERT_ROT, SERVO_INVERT_GRIP
+    SERVO_INVERT_ROT, SERVO_INVERT_GRIP, SERVO_INVERT_LIFT
 };
 
 static uint16_t servo_angle[SERVO_COUNT];   /* 实际角度（含微调） */
@@ -95,6 +103,10 @@ static void servo_ch_init(uint8_t ch, uint16_t pulse)
 			TIM_OC3Init(SERVO_TIM, &oc);
 			TIM_OC3PreloadConfig(SERVO_TIM, TIM_OCPreload_Enable);
 			break;
+		case 4u:
+			TIM_OC4Init(SERVO_TIM, &oc);
+			TIM_OC4PreloadConfig(SERVO_TIM, TIM_OCPreload_Enable);
+			break;
 		default:
 			break;
 	}
@@ -108,12 +120,13 @@ static void servo_ch_set(uint8_t ch, uint16_t pulse)
 		case 1u: TIM_SetCompare1(SERVO_TIM, (uint32_t)pulse); break;
 		case 2u: TIM_SetCompare2(SERVO_TIM, (uint32_t)pulse); break;
 		case 3u: TIM_SetCompare3(SERVO_TIM, (uint32_t)pulse); break;
+		case 4u: TIM_SetCompare4(SERVO_TIM, (uint32_t)pulse); break;
 		default: break;
 	}
 }
 
 /**
-  * 函    数：三路舵机 PWM 初始化
+  * 函    数：两路舵机 PWM 初始化（PC8 夹爪 / PC9 旋转，TIM3 完全重映射）
   * 参    数：无
   * 返 回 值：无
   * 说    明：初始化完成立即输出安全角度（旋转 240°/夹爪 65°）
@@ -125,11 +138,14 @@ void Servo_Init(void)
 	uint8_t i;
 	int32_t d;
 
-	/*开启时钟：GPIO + TIM2（PA1/PA2 是 TIM2 的默认通道，不需要重映射）*/
-	RCC_APB2PeriphClockCmd(SERVO_GPIO_CLK, ENABLE);
+	/*开启时钟：GPIO + 复用功能重映射 + TIM3*/
+	RCC_APB2PeriphClockCmd(SERVO_GPIO_CLK | RCC_APB2Periph_AFIO, ENABLE);
 	RCC_APB1PeriphClockCmd(SERVO_TIM_CLK, ENABLE);
 
-	/*PA1（夹爪）/PA2（旋转）配置为复用推挽输出*/
+	/*TIM3 完全重映射：CH3/CH4 输出到 PC8/PC9*/
+	GPIO_PinRemapConfig(GPIO_FullRemap_TIM3, ENABLE);
+
+	/*PC8/PC9 配置为复用推挽输出*/
 	GPIO_InitStructure.GPIO_Pin = SERVO_GPIO_PIN;
 	GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
 	GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
@@ -143,7 +159,7 @@ void Servo_Init(void)
 	TIM_TimeBaseInitStructure.TIM_RepetitionCounter = 0;
 	TIM_TimeBaseInit(SERVO_TIM, &TIM_TimeBaseInitStructure);
 
-	/*三路一起初始化：先把安全角度算好，PWM 一使能就是安全姿态*/
+	/*两路一起初始化：先把安全角度算好，PWM 一使能就是安全姿态*/
 	for (i = 0; i < (uint8_t)SERVO_COUNT; i++)
 	{
 		d = (int32_t)k_servo_init[i] + (int32_t)k_servo_trim[i];

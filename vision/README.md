@@ -1,5 +1,23 @@
 # vision —— 圆心跟踪（CanMV K230 / OpenMV 通用）
 
+> **现在车上跑的是 [`圆线串口.py`](圆线串口.py)**（circle / linear 命令版 + 串口双向），
+> 本文件主要讲 [`circle_track.py`](circle_track.py)（老的纯 `x,y` 格式）。
+>
+> 两个文件的**画面/坐标约定**（踩过坑，别再破坏）：
+> 1. **采集 800×450（像素级 16:9）**，显示时合成到 800×480 画布再上屏（上下各 15 px 黑边）。
+>    老配置 640×480 是 4:3，会把左右裁掉 25%（"拍不全"的根源）。
+> 2. **相机帧不能直接带偏移上屏**：`show_image(sensor帧, x, y)` 会报
+>    `set vo layer attr failed 1`，屏整块不刷（就是那个"黑屏"）。
+>    必须先 `canvas.draw_image(frame, 0, 15)` 合成，再 `show_image(canvas)`。
+>    代码里 `probe_display()` 会在启动时自动试 direct/composite/copy，打印选了哪个。
+> 3. **坐标只有一套：图像像素坐标**（左上角原点）。串口发的是它，`draw_xxx` 画的是它。
+>    显示层的 (x,y) 只决定"贴在屏上哪儿"，不参与 dx/dy 计算。
+> 4. **一次运行只有一种 VO 输出**：`Display.VIRT` → 只有 IDE 有图、面板全黑；
+>    `Display.ST7701` → 面板 + IDE 都有。"LCD 黑屏但 IDE 有画面"就是选错了这个模式。
+> 5. 怀疑屏/显示有问题：单独跑 [`LCD自检.py`](LCD自检.py)（不碰相机）。
+>    怀疑视野丢没丢 / 光轴偏没偏：跑 [`画面自检.py`](画面自检.py)。
+> 6. **换分辨率后 F103 那边必须同步**：`VISION_CX/CY`、`VISION_TARGET_X/Y`、`VISION_MM_PER_60PX`。
+
 给 F103 工程 `DEBUG_MODE_CIRCLE` 用的相机侧程序：**找到目标圆心，通过 UART 发 `x,y\r\n`**。
 
 ## 文件

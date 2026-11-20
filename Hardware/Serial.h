@@ -50,8 +50,30 @@ void USART3_SendAngleCentiDegrees(int32_t centi_degrees);
 void USART3_SelfTest(void);
 
 /* ============================================================================
- * K230 视觉链路（USART2：TX = PA2 发命令，RX = PA3 收结果，115200 8N1）
+ * K230 视觉链路
  * ----------------------------------------------------------------------------
+ * ★★★ 串口分配表（2026-11 现场最终版：四个外设各管一件事）★★★
+ *
+ *   串口     引脚            接什么                        谁来配
+ *   -------- ---------------- ----------------------------- -------------------
+ *   USART1   PA9 / PA10       六个步进驱动器（二进制总线）   固定，别动
+ *   USART2   PA2 / PA3       JY901 陀螺仪（二进制帧）       固定，别动
+ *   USART3   PB10 / PB11     ★ 无线调试 + 上位机命令 ★     SERIAL_USART3_ENABLE = 1
+ *   UART4    PC10 / PC11     ★ K230（视觉）★               K230_PORT_UART4 / UART4_Init
+ *
+ *   ★★★ PC10/PC11 是 **UART4 自己的引脚**，不是 USART3 的重映射 ★★★
+ *     UART4 是独立外设（挂在 APB1，中断号 52），和 USART3 没有任何关系，所以
+ *     "无线模块接 PB10/PB11" 和 "K230 接 PC10/PC11" **可以同时成立**。
+ *
+ *     旧代码用 "USART3 部分重映射" 去抢 PC10/PC11，等于让 USART3 这个外设
+ *     只能服务 K230，于是：① PB10/PB11 上的无线模块没了串口；② 调试只能挤到
+ *     PA2/PA3 —— 而那里是陀螺仪。三处全错，现在统一改成 UART4。
+ *
+ *   ⚠️ PC10/PC11 不要做任何 GPIO_PinRemapConfig：UART4 是固定引脚。
+ *   ⚠️ 必须用 startup_stm32f10x_hd.s + 宏 STM32F10X_HD，
+ *      md 版启动文件里**没有** UART4_IRQHandler 的向量表项（IRQ 52），
+ *      否则"编译通过、中断永远不进"，白折腾一轮。
+ *
  * 【下行】命令字，一行一条，K230_SendLine() 发（自动补 \r\n）：
  *      "circle"  开始找圆心 → K230 持续回 C 帧
  *      "linear"  开始找直线 → K230 持续回 L 帧
@@ -65,6 +87,14 @@ void USART3_SelfTest(void);
  * 每类帧有自己的序号，主循环用"序号变了"判断来了新帧；
  * 格式错的行只让 K230_BadLine 自增，不会覆盖上一帧好数据。
  * ========================================================================== */
+#define K230_PORT_USART2   2
+#define K230_PORT_USART3   3
+#define K230_PORT_UART4    4                      /* ★ 新增：UART4 = PC10/PC11 */
+#define K230_PORT          K230_PORT_UART4        /* ★ K230 接 PC10(TX)/PC11(RX) → UART4 */
+
+/* UART4：PC10=TX / PC11=RX → K230（固定引脚，无需重映射；需要 STM32F10X_HD） */
+void UART4_Init(uint32_t bound);
+
 #define K230_CMD_CIRCLE   "circle"
 #define K230_CMD_LINEAR   "linear"
 #define K230_CMD_STOP     "stop"

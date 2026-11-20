@@ -1,4 +1,5 @@
 #include "stm32f10x.h"                  // Device header
+#include "Serial.h"                     /* 自己的头文件：函数原型 + K230_PORT 开关 */
 #include "Gyro.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -135,6 +136,7 @@ void Serial_SendNumber(uint32_t Number, uint8_t Length)
   */
 int fputc(int ch, FILE *f)
 {
+	(void)f;                         /* 重定向用不到 FILE*，显式忽略避免 -Wextra 警告 */
 	Serial_SendByte(ch);			//将printf的底层重定向到自己的发送字节函数
 	return ch;
 }
@@ -195,18 +197,26 @@ void USART1_IRQHandler(void)
 {
     static uint8_t RxState = 0;
     static uint8_t pRxPacket = 0;
+    static uint8_t expect = 4;
 
     if (USART_GetITStatus(USART1, USART_IT_RXNE) == SET)
     {
         uint8_t RxData = USART_ReceiveData(USART1);
 
-        /* 状态机解析回包：帧头(地址 0x01~0x05) -> 3 字节数据 -> 包尾 0x6B
-         * 回包格式：[地址][功能码][数据][校验 0x6B]
-         * 0x3A 查询回包：[地址][0x3A][状态][0x6B]，其中状态 bit1 表示已到位
-         * （底盘 1~4 用 0x03 = 使能+到位；物料电机地址 5 的一圈标定也靠这包判断到位） */
+        /* 状态机解析回包。驱动器（张大头 Emm42）的回包有**两种长度**，
+         * 长度由功能码决定，不能一律按 4 字节收：
+         *
+         *   0x3A 查到位   [地址][3A][状态][6B]                        4 字节
+         *   0x36 读位置   [地址][36][符号][位置4字节][6B]             8 字节
+         *                 ↑ 地址=6（升降）时也会回，所以帧头要认到 0x06
+         *
+         * ★ 以前只认 0x01~0x05、且写死 4 字节，导致：
+         *   - 升降电机（地址 6）的回包整帧被丢掉
+         *   - 0x36 读位置的那 8 字节被截成 4 字节，永远拼不出完整帧
+         * 所以"读驱动器当前位置"这个功能实际上一直是坏的。 */
         if (RxState == 0)
         {
-            if (RxData >= 0x01 && RxData <= 0x05)   /* 地址作为帧头 */
+            if (RxData >= 0x01 && RxData <= 0x06)   /* 地址作为帧头（含升降 6） */
             {
                 Serial_RxPacket[0] = RxData;
                 pRxPacket = 1;
@@ -216,10 +226,14 @@ void USART1_IRQHandler(void)
         else if (RxState == 1)
         {
             Serial_RxPacket[pRxPacket++] = RxData;
-            if (pRxPacket >= 4)                     /* 收够 4 字节 */
+
+            if (RxData == 0x36)         expect = 8;   /* 读位置：8 字节 */
+            else                        expect = 4;   /* 0x3A 及默认：4 字节 */
+
+            if (pRxPacket >= expect)
             {
                 RxState = 0;
-                if (Serial_RxPacket[3] == 0x6B)     /* 尾校验 */
+                if (Serial_RxPacket[expect - 1u] == 0x6B)   /* 尾校验 */
                 {
                     Serial_RxFlag = 1;
                 }
@@ -242,10 +256,8 @@ void USART2_Init(uint32_t bound)
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE);
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
 
-    /* 注意：PA2 原来是 USART2_TX，中间让给过舵机；现在舵机在 PA0/PA1，
-     * PA2 空出来了，这里恢复成"发送"——主控要靠它给 K230 发任务码。
-     * ★ 你之前怀疑 PA2 这个脚损坏：发任务码如果 K230 收不到，先量 PA2 有没有波形，
-     *   确认后可以把 K230 改接到 USART3(PB10/PB11) 上（见 SERIAL_USART3_ENABLE）。 */
+    /* 注意：PA2/PA3 现在是**陀螺仪 JY901 专用口**（USART2），这里只负责
+     * 陀螺仪的双向通讯；K230 已经挪到 UART4（PC10/PC11），不再走 PA2/PA3。 */
 
     /* PA2 - USART2_TX 复用推挽输出 */
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_2;
@@ -253,7 +265,7 @@ void USART2_Init(uint32_t bound)
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
-    /* PA3 - USART2_RX 上拉输入（K230 的 TX / 陀螺仪的 TX 接这里） */
+    /* PA3 - USART2_RX 上拉输入（陀螺仪 JY901 的 TX 接这里） */
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_3;
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
@@ -517,6 +529,9 @@ uint8_t K230_GetCenter(uint16_t *x, uint16_t *y)
 
 /* USART2 模拟按键：收到 k:1 / k:2 / k:3 时置位 */
 #include "motor.h"
+/* 注意：PA2/PA3 是陀螺仪的专用口，USART2 中断里**只**喂陀螺仪解析器，
+ * 不再挂任何调试行缓冲 —— 调试（上位机命令）已经回到 USART3/PB10-PB11。 */
+
 void USART2_IRQHandler(void)
 {
     static uint8_t state = 0;
@@ -529,7 +544,13 @@ void USART2_IRQHandler(void)
         /* USART2 同时接收电脑调试文本和 JY901 二进制帧；二进制数据交给
          * 陀螺仪解析器，不能像普通串口回显那样原样发回。 */
         Gyro_ProcessByte(ch);
-        K230_FeedByte(ch);          /* K230 的 "x,y" 文本行，和上面的 k:数字 互不影响 */
+#if K230_PORT == K230_PORT_USART2
+        /* K230 和陀螺仪现在共用 USART2：
+         *   - Gyro_ProcessByte 只认 0x55 0x53 开头的二进制帧，ASCII 的 "C470,..." 不会误判
+         *   - K230_FeedByte 只认可打印字符，二进制帧里的 0x55 会被当作"非文本"丢掉整行
+         * 两者互不干扰。但**别同时用**：陀螺仪帧会把 K230 正在收的那一行打断。 */
+        K230_FeedByte(ch);
+#endif
         switch (state)
         {
             case 0:
@@ -614,7 +635,7 @@ void USART2_SendInt(int32_t v)
 }
 
 /* ============================================================================
- * 主控 -> K230：命令字（ASCII 文本行，走 USART2 TX = PA2，115200 8N1）
+ * 主控 -> K230：命令字（ASCII 文本行，走 UART4 TX = PC10，115200 8N1）
  * ----------------------------------------------------------------------------
  * 用文本而不是二进制，是为了 K230 那边用 Python 直接 readline() 解析，
  * 调试时也能在串口终端上一眼看出收到了什么。
@@ -626,12 +647,28 @@ void USART2_SendInt(int32_t v)
  * 回帧格式和字段含义见本文件上方"K230 文本帧解析"那段注释。
  * ========================================================================== */
 
+/* K230 专用发送：**绝不能**用 USART3_SendByte，因为那个现在指向无线调试口。
+ * 目标外设由 K230_PORT 决定：当前 UART4（PC10=TX / PC11=RX，固定引脚）。 */
+static void K230_PutByte(uint8_t b)
+{
+#if K230_PORT == K230_PORT_UART4
+    USART_SendData(UART4, b);
+    while (USART_GetFlagStatus(UART4, USART_FLAG_TXE) == RESET);
+#elif K230_PORT == K230_PORT_USART3
+    USART_SendData(USART3, b);
+    while (USART_GetFlagStatus(USART3, USART_FLAG_TXE) == RESET);
+#else
+    USART_SendData(USART2, b);
+    while (USART_GetFlagStatus(USART2, USART_FLAG_TXE) == RESET);
+#endif
+}
+
 /* 发一整行自定义文本（结尾自动补 \r\n） */
 void K230_SendLine(const char *s)
 {
-    while (*s != '\0') USART2_SendByte((uint8_t)*s++);
-    USART2_SendByte('\r');
-    USART2_SendByte('\n');
+    while (*s != '\0') K230_PutByte((uint8_t)*s++);
+    K230_PutByte('\r');
+    K230_PutByte('\n');
 }
 
 /* ---------------- USART3：无线串口（上位机 115200） ----------------
@@ -649,19 +686,54 @@ static volatile uint8_t usart3_rx_ready_idx = 0;   /* 已收完、等主循环�
 static volatile uint8_t usart3_rx_ready = 0;
 static volatile uint8_t usart3_rx_len = 0;
 
-/* USART3 开关（默认映射 TX=PB10 / RX=PB11；也可以完全重映射到 PC10/PC11）
+/* USART3 开关 —— 调试日志（USART3_Printf / USART3_SendString / ReadLine）走这里
  *
- *   0 = 关闭（当前）：PB10/PB11 接 OLED 的 SDA/SCL（见 OLED.c），
- *       USART3_Init() 什么都不做，USART3_SendXxx / ReadLine 全变空操作，
- *       主程序里原有的打印语句不用删，也不影响 OLED。
+ *   0 = 关闭：USART3_Init() 什么都不做，USART3_SendXxx / ReadLine 全变空操作，
+ *       主程序里原有的打印语句不用删，也不占用任何引脚。
  *
- *   1 = 用默认引脚 PB10(TX) / PB11(RX) —— 此时 OLED 不能接在这两个脚上。
+ *   1 = ★当前★ 默认引脚 PB10(TX) / PB11(RX) —— 接**无线串口模块**（上位机调试）
  *
- *   2 = USART3 完全重映射 → PC10(TX) / PC11(RX)，★推荐★
- *       OLED 继续用 PB10/PB11，互不冲突，等于白捡一路完整串口。
- *       PC10/PC11 在本工程里没有别的用途（PC13/14/15 是板载 LED）。
- *       接线：PC10 → USB-TTL 的 RX，PC11 ← USB-TTL 的 TX，GND 共地。 */
+ *   2 = USART3 部分重映射 → PC10(TX) / PC11(RX)   ★已废弃，别再用★
+ *       PC10/PC11 是 **UART4** 的地盘（独立外设，中断号 52），和 USART3 无关。
+ *       选 2 只是把 USART3 这个外设搬到 K230 的线上，PB10/PB11 的无线模块
+ *       从此没有串口可用。K230 请走 K230_PORT = K230_PORT_UART4。
+ *
+ * 现场分配（详见 Serial.h 顶部的串口分配表）：
+ *     USART3 = 无线调试（PB10/PB11）   ← 当前设置
+ *     UART4  = K230（PC10/PC11）
+ * 两者是不同外设，各走各的线，调试日志不会串到 K230 上。
+ *
+ * ⚠️ 若哪天换回 48 脚的 C8T6（LQFP48 只有 PC13/14/15），PC10/PC11 不存在，
+ *    只能用 1（PB10/PB11）或 0。 */
 #define SERIAL_USART3_ENABLE   1
+
+/* ============================================================================
+ * ★ 串口分工（2026-11 现场最终版）★
+ * ----------------------------------------------------------------------------
+ *   USART1  PA9(TX)  / PA10(RX)  →  6 个步进驱动器 + 烧录口（不动）
+ *   USART2  PA2(TX)  / PA3(RX)   →  JY901 陀螺仪（不动，中断里只跑 Gyro_ProcessByte）
+ *   USART3  PB10(TX) / PB11(RX)  →  **无线调试 + 上位机命令**（默认映射，1）
+ *   UART4   PC10(TX) / PC11(RX)  →  **K230**（独立外设，固定引脚）
+ *
+ * 没有 DEBUG_UART 那套重定向了：调试日志固定走 USART3（PB10/PB11），
+ * 陀螺仪独占 USART2，K230 独占 UART4，三者互不干扰。
+ *
+ * ⚠️ USART3 是**同一个外设**，引脚只能选一套（SERIAL_USART3_ENABLE = 1/2/0）。
+ *    PC10/PC11 归 UART4 管，别再让 USART3 去重映射抢它。
+ * ========================================================================== */
+
+/* K230 挂在 USART3 但 USART3 被关掉了 —— 直接编译报错，别等到现场才发现收不到 */
+#if (K230_PORT == K230_PORT_USART3) && (SERIAL_USART3_ENABLE == 0)
+  #error "K230_PORT = USART3 但 SERIAL_USART3_ENABLE = 0，K230 会收不到任何数据"
+#endif
+
+/* K230 挂在 UART4，但芯片密度选错了 —— UART4 只存在于高密度/超大容量/互联型器件上，
+ * 中密度（MD，启动文件 startup_stm32f10x_md.s）里连 UART4_IRQHandler 的向量都没有。
+ * 这个 #error 就是为了拦住"编译通过、中断永远不进"的情况。 */
+#if (K230_PORT == K230_PORT_UART4) \
+    && !defined(STM32F10X_HD) && !defined(STM32F10X_XL) && !defined(STM32F10X_CL)
+  #error "K230_PORT = UART4 但没定义 STM32F10X_HD（UART4 只在 HD/XL/CL 器件上存在）"
+#endif
 
 #if   SERIAL_USART3_ENABLE == 1
   #define U3_TX_PORT   GPIOB
@@ -696,8 +768,10 @@ void USART3_Init(uint32_t bound)
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART3, ENABLE);
 
 #if SERIAL_USART3_ENABLE == 2
-    /* USART3 完全重映射：TX -> PC10，RX -> PC11 */
-    GPIO_PinRemapConfig(GPIO_FullRemap_USART3, ENABLE);
+    /* USART3 **部分**重映射：TX -> PC10，RX -> PC11
+     * ★ 必须用 GPIO_PartialRemap_USART3。GPIO_FullRemap_USART3 是 PD8/PD9，
+     *   LQFP64 上没有这两个脚，用错了会"程序照发、引脚无输出"。 */
+    GPIO_PinRemapConfig(GPIO_PartialRemap_USART3, ENABLE);
 #endif
 
     /* TX：复用推挽 */
@@ -743,6 +817,16 @@ void USART3_Init(uint32_t bound)
 
 /* 取走一行命令（不含 \r\n），有整行返回 1；没有返回 0。
  * 复制期间关 RXNE 中断，避免中断正好把同一缓冲区换回来写。 */
+/* 调试口（无线模块）的接收中断开关：调试口固定是 USART3（PB10/PB11）。 */
+static void Debug_RxIrq(uint8_t on)
+{
+#if SERIAL_USART3_ENABLE
+    USART_ITConfig(USART3, USART_IT_RXNE, on ? ENABLE : DISABLE);
+#else
+    (void)on;
+#endif
+}
+
 uint8_t USART3_ReadLine(char *line, uint8_t size)
 {
     uint8_t i = 0;
@@ -750,11 +834,11 @@ uint8_t USART3_ReadLine(char *line, uint8_t size)
 
     if (size == 0u) return 0u;
 
-    USART_ITConfig(USART3, USART_IT_RXNE, DISABLE);
+    Debug_RxIrq(0u);
 
     if (!usart3_rx_ready)
     {
-        USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);
+        Debug_RxIrq(1u);
         return 0u;
     }
 
@@ -767,38 +851,46 @@ uint8_t USART3_ReadLine(char *line, uint8_t size)
     line[i] = '\0';
     usart3_rx_ready = 0u;
 
-    USART_ITConfig(USART3, USART_IT_RXNE, ENABLE);
+    Debug_RxIrq(1u);
 
     return 1u;
 }
 
-/* USART3 接收中断：按 \r 或 \n 分帧。缓冲区满了就丢整行重新同步。 */
+/* 把收到的字节按 \r 或 \n 分成一行一行（调试口的上位机命令）。
+ * 只有 USART3（无线调试，PB10/PB11）的中断调这个。 */
+static void usart3_rx_feed(uint8_t ch)
+{
+    if (ch == '\r' || ch == '\n')
+    {
+        if (usart3_rx_len != 0u)
+        {
+            usart3_rx_buf[usart3_rx_active][usart3_rx_len] = '\0';
+            usart3_rx_ready_idx = usart3_rx_active;
+            usart3_rx_ready = 1u;
+            usart3_rx_active ^= 1u;          /* 换另一个缓冲区继续收 */
+            usart3_rx_len = 0u;
+            USART3_RxCount++;
+        }
+    }
+    else if (usart3_rx_len < (USART3_LINE_MAX - 1u))
+    {
+        usart3_rx_buf[usart3_rx_active][usart3_rx_len++] = (char)ch;
+    }
+    else
+    {
+        usart3_rx_len = 0u;                  /* 超长，丢弃整行 */
+    }
+}
+
+/* USART3 接收中断（PB10/PB11 = 无线调试 + 上位机命令）：只喂行缓冲。
+ * K230 的回包现在走 UART4，见下面的 UART4_IRQHandler。 */
 void USART3_IRQHandler(void)
 {
     if (USART_GetITStatus(USART3, USART_IT_RXNE) == SET)
     {
-        uint8_t ch = USART_ReceiveData(USART3);
+        uint8_t ch = (uint8_t)USART_ReceiveData(USART3);
 
-        if (ch == '\r' || ch == '\n')
-        {
-            if (usart3_rx_len != 0u)
-            {
-                usart3_rx_buf[usart3_rx_active][usart3_rx_len] = '\0';
-                usart3_rx_ready_idx = usart3_rx_active;
-                usart3_rx_ready = 1u;
-                usart3_rx_active ^= 1u;          /* 换另一个缓冲区继续收 */
-                usart3_rx_len = 0u;
-                USART3_RxCount++;
-            }
-        }
-        else if (usart3_rx_len < (USART3_LINE_MAX - 1u))
-        {
-            usart3_rx_buf[usart3_rx_active][usart3_rx_len++] = (char)ch;
-        }
-        else
-        {
-            usart3_rx_len = 0u;                  /* 超长，丢弃整行 */
-        }
+        usart3_rx_feed(ch);                      /* 上位机命令（一行一条） */
 
         USART_ClearITPendingBit(USART3, USART_IT_RXNE);
     }
@@ -807,12 +899,82 @@ void USART3_IRQHandler(void)
 void USART3_SendByte(uint8_t byte)
 {
 #if SERIAL_USART3_ENABLE
+    /* 调试输出固定走 USART3 = PB10(TX) / PB11(RX)，无线模块接这里 */
     USART_SendData(USART3, byte);
     while (USART_GetFlagStatus(USART3, USART_FLAG_TXE) == RESET);
 #else
-    /* 串口已关闭（PB10/PB11 给了 OLED）：直接返回，避免等一个永远不会置位的 TXE */
+    /* 串口已关闭：直接返回，避免等一个永远不会置位的 TXE */
     (void)byte;
 #endif
+}
+
+/* ============================================================================
+ * UART4：PC10(TX) / PC11(RX) → K230（视觉链路）
+ * ----------------------------------------------------------------------------
+ * ★ 为什么是 UART4 而不是 "USART3 部分重映射到 PC10/PC11"：
+ *     PC10/PC11 本来就是 UART4 的固定引脚，UART4 是 APB1 上的**独立外设**
+ *     （中断号 52），跟 USART3 毫无关系。用 UART4 之后 USART3 就完整地
+ *     留给 PB10/PB11 的无线调试模块，两条线互不干扰。
+ *
+ * ★ 三个前提（少一个就"编译通过、中断不进"）：
+ *     1) 启动文件用 startup_stm32f10x_hd.s（md 版没有 UART4_IRQHandler 向量）
+ *     2) 编译宏 STM32F10X_HD（否则 UART4 这几个寄存器都不存在）
+ *     3) 器件选 STM32F103RC（256K Flash / 48K RAM）
+ *
+ * ★ PC10/PC11 是固定复用脚，**不要**做任何 GPIO_PinRemapConfig。
+ * ========================================================================== */
+void UART4_Init(uint32_t bound)
+{
+    GPIO_InitTypeDef GPIO_InitStructure;
+    USART_InitTypeDef USART_InitStructure;
+    NVIC_InitTypeDef NVIC_InitStructure;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_UART4, ENABLE);   /* UART4 在 APB1 上 */
+
+    /* PC10 = UART4_TX：复用推挽输出 */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_10;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
+
+    /* PC11 = UART4_RX：上拉输入，空闲为高（接 K230 的 TX） */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_11;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
+
+    USART_InitStructure.USART_BaudRate = bound;
+    USART_InitStructure.USART_WordLength = USART_WordLength_8b;
+    USART_InitStructure.USART_StopBits = USART_StopBits_1;
+    USART_InitStructure.USART_Parity = USART_Parity_No;
+    USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None;
+    USART_InitStructure.USART_Mode = USART_Mode_Rx | USART_Mode_Tx;
+    USART_Init(UART4, &USART_InitStructure);
+
+    /* 接收中断：K230 回包 C/L/NG，一行一帧 */
+    USART_ITConfig(UART4, USART_IT_RXNE, ENABLE);
+
+    NVIC_InitStructure.NVIC_IRQChannel = UART4_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 2;
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&NVIC_InitStructure);
+
+    USART_Cmd(UART4, ENABLE);
+}
+
+/* UART4 接收中断（K230 → F103）：只喂 K230 帧解析，其它一概不碰。
+ * md 启动文件里没有这个向量，必须用 startup_stm32f10x_hd.s。 */
+void UART4_IRQHandler(void)
+{
+    if (USART_GetITStatus(UART4, USART_IT_RXNE) == SET)
+    {
+        uint8_t ch = (uint8_t)USART_ReceiveData(UART4);
+
+        K230_FeedByte(ch);                       /* K230 回包：C/L/NG */
+
+        USART_ClearITPendingBit(UART4, USART_IT_RXNE);
+    }
 }
 
 static void USART3_SendUnsigned(uint32_t value)

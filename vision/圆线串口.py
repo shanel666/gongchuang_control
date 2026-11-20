@@ -50,6 +50,11 @@ try:
 except Exception:
     HAS_MACHINE = False
 
+try:
+    import image as image_mod          # 只用来在"相机还没起来"时先给屏送一张测试图
+except Exception:
+    image_mod = None
+
 
 # ============================ 一、串口 ============================
 BAUD      = 115200
@@ -60,24 +65,50 @@ SEND_EVERY_MS = 100     # 有数据时多久回一帧（10 Hz 够了，主控只
 NG_EVERY_MS   = 500     # 没找到时多久回一次 NG（别刷屏）
 
 # ============================ 二、图像 ============================
-LCD_W = 800
-LCD_H = 480
+# ---------------------------------------------------------------------
+# ★★ 这里只允许存在【一套】坐标：图像像素坐标（左上角原点）。
+#    串口发出去的是它，draw_xxx 画的是它，算 dx/dy 用的也是它。
+#    显示层只决定"图像贴在屏上哪儿"，绝不参与任何坐标计算。
+#
+# ★★ 分辨率：800x450（像素级 16:9，= 1920x1080 × 0.41667 等比缩小）
+#    · 为什么不是 640x480（4:3）：GC2093 是 16:9（1920x1080）。要 4:3，K230 只能
+#      把 16:9 裁成 4:3（1920x1080 → 1440x1080，左右各丢 1/8、横向共丢 25%），
+#      这就是"拍不全、视野受影响"的根源。
+#    · 为什么不是 800x480（填满屏）：屏是 5:3，而感光片是 16:9，硬填就会
+#      纵向拉伸约 6.7%（圆变椭圆）或裁掉约 6% 宽。宁可留 15 px 黑边。
+#    · 屏是 800x480，800x450 就贴在 (0,15)，上下各一条 15 px 黑边。
+#
+# ★★ 显示走"合成画布"（见 show() / probe_display()）：
+#    实测结论 —— 这个固件的 VO 图层：
+#      · image.Image 造的 800x450 @(0,15) 能上屏；
+#      · 但把 sensor.snapshot() 的相机帧直接 show_image 就会
+#        报 "set vo layer attr failed 1"，屏直接不刷。
+#    所以每帧先把相机帧 draw_image 到一张 800x480 的画布上，再整张送屏。
+#    代价是多一次 720 KB 的 blit（K230 上 1~3 ms，不影响找圆）。
+#    启动时会自动试 direct / composite / copy 三种，哪个能用就固定用哪个，
+#    不需要你猜。
+#
+# ★★ 换了分辨率，F103 那边必须同步（见 vision.h）：
+#        VISION_CX / VISION_CY           = 400 / 225
+#        VISION_TARGET_X / VISION_TARGET_Y  要重新标定（别抄旧值 470/170）
+#        VISION_MM_PER_60PX              ≈ 37（原来是 35）
+# ---------------------------------------------------------------------
+IMG_W = 800            # 16:9（1920x1080 × 0.41667）
+IMG_H = 450
+IMG_CX = IMG_W // 2    # 400：图像几何中心（屏上黄十字画在这里）
+IMG_CY = IMG_H // 2    # 225
 
 # ---- 屏幕 ----
 # 立创·庐山派 K230 的 3.1 寸 MIPI 屏是**扩展板**（不在主板上），HDMI 也是扩展板。
-#   没接屏幕 -> Display.init 会失败或什么都不显示，这是正常的，串口照样工作。
-#   想看画面有两种办法：
-#     a) USE_DISPLAY = True 且接了屏：直接看屏
-#     b) USE_DISPLAY = True 但不接屏：CanMV IDE 里那个帧缓冲窗口也能看（to_ide=True）
-#   只想稳定跑串口、不想被显示拖累：USE_DISPLAY = False
-USE_DISPLAY  = True
+# ★ 一次运行只能初始化一种 VO 输出：走了 VIRT 就只有 IDE 有画面、面板全黑；
+#   反之走了 ST7701 就面板 + IDE 都有（to_ide=True）。所以面板接着就选 True。
+# ★ 画布尺寸固定 = 屏的物理分辨率 800x480；图像比画布小，靠合成画布贴上去。
+#   USE_DISPLAY_LCD = False：只送 CanMV IDE 帧缓冲（VIRT，画布=图像，1:1）。
+USE_DISPLAY     = True
+USE_DISPLAY_LCD = True
+LCD_W = 800
+LCD_H = 480
 LCD_DRIVER   = "ST7701"    # 3.1 寸 MIPI 屏用 ST7701；HDMI 扩展板改成 "LT9611"
-
-# 画面中心（640×480 的中心）。K230 屏上会画一个十字，方便肉眼对比偏差。
-IMG_CX = 320
-IMG_CY = 240
-IMG_W = 640
-IMG_H = 480
 
 THRESH       = 70
 THRESH_SWEEP = (0, -25, 40)   # 阈值扫描：只在上一轮不够用时才试下一个
@@ -85,8 +116,13 @@ DILATE_PX    = 1
 STRIDE       = 1
 
 # ============================ 三、圆孔判据 ============================
-MIN_SIDE = 22
-MIN_AREA = 180
+# ★ 这些是"像素"门限，跟着分辨率走。640x480(4:3) -> 800x450(16:9) 之后，
+#   同一个实物在画面里线性小约 0.9375 倍、面积小约 0.88 倍：
+#       MIN_SIDE  22 -> 21
+#       MIN_AREA 180 -> 160
+#   几乎和原来一样，所以离远一点的圆环不会被判"太小"。
+MIN_SIDE = 21
+MIN_AREA = 160
 FILL_MIN = 0.80         # 实心度：孔≈1.0；环间细缝 0.1~0.75
 AR_MIN   = 0.55         # 边上会被拍成椭圆，放宽
 AR_MAX   = 1.80
@@ -94,8 +130,8 @@ ENC_MIN_HITS = 4        # 8 方向里至少几个"外面是黑的"，不满足�
 EDGE_MARGIN  = 1
 
 # 宽松档（只用于"只看见 1 个圆时找伴圆"）
-LOOSE_MIN_SIDE = 14
-LOOSE_MIN_AREA = 60
+LOOSE_MIN_SIDE = 13     # 原 14
+LOOSE_MIN_AREA = 52     # 原 60
 LOOSE_FILL_MIN = 0.50
 LOOSE_AR_MIN   = 0.45
 LOOSE_AR_MAX   = 2.20
@@ -115,7 +151,7 @@ MODE_IDLE   = "idle"
 MODE_CIRCLE = "circle"
 MODE_LINEAR = "linear"
 
-VERSION = "圆线串口 v1（circle / linear 命令版）"
+VERSION = "圆线串口 v1.2（16:9 800x450 全视野 / circle + linear）"
 
 UART_OBJ = None        # 全局留着，退出时统一 deinit（省得下次重跑串口说"已被占用"）
 DISPLAY_OK = False     # 显示初始化成功才画屏；没接屏就一路跳过，串口不受影响
@@ -184,11 +220,17 @@ def feed_lines(state, data):
 
 
 def classify_command(line):
-    """把一行命令变成 MODE_xxx；不认识的返回 None。"""
+    """把一行命令变成 MODE_xxx；不认识的返回 None。
+
+    兼容几种写法（主控那边发哪个都行）：
+        circle / c / q / q?   都当作"读圆心坐标"
+        linear / l            读三条线的斜率+偏航
+        stop / idle / none    停
+    """
     s = (line or "").strip().lower()
-    if s.startswith("circle"):
+    if s.startswith("circle") or s in ("c", "q", "q?", "circle?"):
         return MODE_CIRCLE
-    if s.startswith("linear"):
+    if s.startswith("linear") or s == "l":
         return MODE_LINEAR
     if s.startswith("stop") or s.startswith("idle") or s.startswith("none"):
         return MODE_IDLE
@@ -574,10 +616,88 @@ def close_uart():
     UART_OBJ = None
 
 
+# ---------------- 显示：三种送图方式，启动时自动挑一个能用的 ----------------
+#
+# 实测（vision/LCD自检.py 的尺寸/偏移矩阵）：
+#   · image.Image 造的 800x450 @(0,15) —— 能上屏；
+#   · 主循环里 sensor.snapshot() 的相机帧直接 show_image —— 报
+#     "set vo layer attr failed 1"，屏不刷。
+#   所以别猜，三种都实现，启动时按"最可能成功"的顺序挨个试：
+#     composite : 帧 draw_image 到 800x480 画布再整张送     已验证可行，多一次 blit
+#     copy      : 先 img.copy()（落到 MMZ）再合成           最保险，多一次拷贝
+#     direct    : show_image(img, x, y)                   最省，但相机帧可能被拒
+#   顺序之所以把 direct 放最后：一旦 show_image 失败，VO 图层可能被搞坏，
+#   后面的尝试也会跟着失败 —— 所以先试最保险的。
+#   试出哪个能用就固定用哪个，并打印出来。
+
+_disp_mode = None       # None / "composite" / "copy" / "direct"
+_MODE_ORDER = ("composite", "copy", "direct")
+_canvas = None          # 800x480 的合成画布（复用，别每帧新建）
+
+
+def _place(img):
+    """图像贴在画布上的左上角坐标（只用于显示，不参与任何坐标计算）。"""
+    if USE_DISPLAY_LCD:
+        return (LCD_W - img.width()) // 2, (LCD_H - img.height()) // 2
+    return 0, 0
+
+
+def _canvas_image():
+    global _canvas
+    if _canvas is None:
+        _canvas = image_mod.Image(LCD_W, LCD_H, image_mod.RGB565)
+        _canvas.clear()          # 黑底；上下留的黑边就是这个底色
+    return _canvas
+
+
+def _put(img, mode):
+    """按指定方式把一帧送上屏。失败会抛异常，由调用方决定怎么办。"""
+    x, y = _place(img)
+    if mode == "direct":
+        if x == 0 and y == 0:
+            Display.show_image(img)
+        else:
+            Display.show_image(img, x=x, y=y)
+        return
+    src = img
+    if mode == "copy":
+        src = img.copy()         # 换成 MMZ 里的普通图像，绕开"相机帧不能直接上屏"
+    buf = _canvas_image()
+    buf.draw_image(src, x, y)
+    Display.show_image(buf)
+
+
+def probe_display(img):
+    """启动时拿第一帧试三种送图方式，挑一个能用的。返回 True = 屏上有画面。"""
+    global _disp_mode, DISPLAY_OK
+    if not DISPLAY_OK or img is None:
+        return False
+    names = {"composite": "合成到 800x480 画布",
+             "copy": "先 copy 转 MMZ 再合成",
+             "direct": "相机帧直接上屏"}
+    for mode in _MODE_ORDER:
+        try:
+            _put(img, mode)
+            _disp_mode = mode
+            print("      显示方式：%s（%s）" % (mode, names[mode]))
+            return True
+        except Exception as e:
+            print("      %s 不可用：%s" % (mode, e))
+    DISPLAY_OK = False
+    _disp_mode = None
+    print("      三种都失败 -> 不画屏。把 IMG_W/IMG_H 改成 %dx%d 再试"
+          % (LCD_W, LCD_H))
+    return False
+
+
 def show(img):
-    """把画面送到屏 / IDE 帧缓冲。没屏或出错就静默跳过 —— 绝不影响串口。"""
-    global DISPLAY_OK
-    if not DISPLAY_OK:
+    """把画面送到屏 / IDE 帧缓冲。没屏或出错就静默跳过 —— 绝不影响串口。
+
+    送图方式由 probe_display() 在启动时定好，这里只负责每帧执行；
+    万一运行中失败，按 _MODE_ORDER 往后退一种再试，而不是直接关屏。
+    """
+    global DISPLAY_OK, _disp_mode      # ★ 两个都必须声明：前面读，后面还会改
+    if not DISPLAY_OK or _disp_mode is None:
         return
 
     # 画面中心画个黄十字：肉眼就能看出圆心离中心多远
@@ -587,44 +707,196 @@ def show(img):
         pass
 
     try:
-        Display.show_image(img,
-                           x=round((LCD_W - img.width()) / 2),
-                           y=round((LCD_H - img.height()) / 2))
+        _put(img, _disp_mode)
+        return
     except Exception as e:
-        DISPLAY_OK = False
-        print("show_image 失败，后面不再画屏（串口继续）：", e)
+        last = e
+
+    # 自救：按顺序换下一种送图方式
+    if image_mod is not None and _disp_mode in _MODE_ORDER:
+        for mode in _MODE_ORDER[_MODE_ORDER.index(_disp_mode) + 1:]:
+            try:
+                _put(img, mode)
+                print("  show_image 失败（%s），已自动切到 %s" % (last, mode))
+                _disp_mode = mode
+                return
+            except Exception as e2:
+                last = e2
+
+    DISPLAY_OK = False
+    print("show_image 失败（方式=%s，图像 %dx%d，画布 %dx%d）：%s"
+          % (_disp_mode, img.width(), img.height(), LCD_W, LCD_H, last))
+    print("  -> 串口继续工作，只是不再画屏")
+
+
+# ---------------- 启动自检：每一步都打印，卡住了能一眼看出卡在哪 ----------------
+#
+# ★ 为什么要先给屏送一张测试图：
+#   Display.init() 成功 ≠ 屏上有画面。只有 show_image() 真被调用过，屏才亮。
+#   如果程序在后面（相机 / 媒体管道 / 串口）卡住，以前的表现就是"屏全黑，
+#   分不清是屏坏了还是程序没跑到"。现在先画一张"K230 OK"，之后卡住也看得见。
+
+def canvas_size():
+    if USE_DISPLAY_LCD:
+        return LCD_W, LCD_H
+    return IMG_W, IMG_H
+
+
+_banner_buf = None      # 复用一个缓冲区，别每次都新申请（K230 的 MMZ 很宝贵）
+
+
+def show_banner(text, color=(0, 0, 160), sub=""):
+    """不依赖相机，直接造一张图送到屏上。返回 True = 真的送出去了。
+
+    启动过程每走一步就刷一次，于是"卡住时屏上显示的是哪一行"就等于
+    "程序卡在哪一步" —— 黑屏也能当调试输出用。
+    """
+    global _banner_buf
+    if not DISPLAY_OK:
+        return False
+    if image_mod is None:
+        print("  (没有 image 模块，跳过测试画面)")
+        return False
+
+    w, h = canvas_size()
+    try:
+        if _banner_buf is None or _banner_buf.width() != w or _banner_buf.height() != h:
+            _banner_buf = image_mod.Image(w, h, image_mod.RGB565)
+        buf = _banner_buf
+    except Exception as e:
+        print("  造测试图失败：", e)
+        return False
+
+    try:
+        buf.clear()
+        buf.draw_rectangle(0, 0, w - 1, h - 1, color=color, thickness=8)
+        ok = False
+        try:
+            buf.draw_string_advanced(20, h // 3, 40, text, color=(255, 255, 255))
+            if sub:
+                buf.draw_string_advanced(20, h // 3 + 56, 24, sub,
+                                         color=(255, 255, 255))
+            ok = True
+        except Exception:
+            pass
+        if not ok:
+            try:
+                buf.draw_string(20, h // 3, text, color=(255, 255, 255), scale=3)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        Display.show_image(buf)
+        return True
+    except Exception as e:
+        print("  show_image 失败：", e)
+        return False
+
+
+def fatal(step, e):
+    """关键一步失败：屏上留一张红底报错图，然后原地待着（还能按 IDE 停止）。"""
+    print("!! [%s] 失败：%s" % (step, e))
+    show_banner("FAIL %s" % step, (150, 0, 0), str(e)[:36])
+    while True:
+        exitpoint()
+        time.sleep_ms(500)
 
 
 def main():
     global UART_OBJ
     global DISPLAY_OK
 
-    sensor = Sensor(width=1280, height=960)
-    sensor.reset()
-    sensor.set_framesize(width=IMG_W, height=IMG_H)
-    sensor.set_pixformat(Sensor.RGB565)
+    # ---------- [1/6] 相机：感光片原生 1920x1080，通道 0 等比缩到 IMG_W x IMG_H ----------
+    print("[1/6] 打开相机 ...")
+    try:
+        sensor = Sensor(id=2)          # 庐山派板载 CSI2 = id 2（默认也是 2）
+        sensor.reset()
+        sensor.set_framesize(chn=CAM_CHN_ID_0, width=IMG_W, height=IMG_H)
+        sensor.set_pixformat(Sensor.RGB565, chn=CAM_CHN_ID_0)
+        print("      相机 OK")
+    except Exception as e:
+        print("!! [1/6] 相机初始化失败：", e)
+        return
 
-    # ---- 显示：接不上屏也不能影响串口 ----
+    # ---------- [2/6] 显示：先送一张测试图，证明"显示通路活着" ----------
+    print("[2/6] 初始化显示 ...")
     DISPLAY_OK = False
     if USE_DISPLAY:
         try:
-            drv = getattr(Display, LCD_DRIVER, Display.ST7701)
-            Display.init(drv, width=LCD_W, height=LCD_H, to_ide=True)
+            if USE_DISPLAY_LCD:
+                drv = getattr(Display, LCD_DRIVER, Display.ST7701)
+                Display.init(drv, width=LCD_W, height=LCD_H, to_ide=True)
+                print("      显示：%s %dx%d，图像摆在 (%d,%d)（同时送 IDE 帧缓冲）"
+                      % (LCD_DRIVER, LCD_W, LCD_H,
+                         (LCD_W - IMG_W) // 2, (LCD_H - IMG_H) // 2))
+            else:
+                Display.init(Display.VIRT, width=IMG_W, height=IMG_H, to_ide=True)
+                print("      显示：IDE 帧缓冲 %dx%d（画布=图像，零偏移）"
+                      % (IMG_W, IMG_H))
             DISPLAY_OK = True
-            print("显示已初始化：%s %dx%d（画面同时送到 IDE 帧缓冲窗口）"
-                  % (LCD_DRIVER, LCD_W, LCD_H))
         except Exception as e:
-            print("显示初始化失败：%s" % e)
-            print("  -> 没接 3.1 寸屏 / HDMI 扩展板时这是正常的，串口继续工作。")
-            print("  -> 想看画面：接屏，或用 CanMV IDE 的帧缓冲窗口。")
+            print("      显示初始化失败：%s" % e)
+            print("      -> 没接 3.1 寸屏 / HDMI 扩展板时这是正常的，串口继续工作。")
 
-    MediaManager.init()
-    sensor.run()
-    clock = time.clock()
+    if DISPLAY_OK:
+        if show_banner("STEP 2 DISPLAY OK", (0, 0, 160), "next: MediaManager.init"):
+            print("      测试图已送到屏上（屏上应该出现蓝底白字）")
+        else:
+            print("      测试图没送出去 —— 显示通路有问题，先跑 LCD自检.py")
 
-    u = open_uart()
+    # ---------- [3/6] 媒体管道 ----------
+    print("[3/6] MediaManager.init() ...")
+    show_banner("STEP 3 MEDIA", (0, 0, 160), "MediaManager.init()")
+    try:
+        MediaManager.init()
+        print("      MediaManager OK")
+    except Exception as e:
+        fatal("MediaManager", e)
+
+    # ---------- [4/6] 启动出图 ----------
+    print("[4/6] sensor.run() ...")
+    show_banner("STEP 4 RUN", (0, 0, 160), "sensor.run()")
+    try:
+        sensor.run()
+        print("      sensor.run OK")
+    except Exception as e:
+        fatal("sensor.run", e)
+
+    # ---------- [5/6] 串口 ----------
+    print("[5/6] 打开 UART%d ..." % UART_ID)
+    show_banner("STEP 5 UART", (0, 0, 160), "UART%d" % UART_ID)
+    try:
+        u = open_uart()
+    except Exception as e:
+        print("      串口没起来（不影响画面）：", e)
+        u = None
     UART_OBJ = u
+
+    # ---------- [6/6] 首帧 ----------
+    print("[6/6] 取第一帧 ...")
+    show_banner("STEP 6 FRAME", (0, 0, 160), "sensor.snapshot()")
+    try:
+        probe = sensor.snapshot()
+    except Exception as e:
+        probe = None
+        print("      取帧失败：", e)
+    if probe is not None:
+        print("      实际出图 = %dx%d" % (probe.width(), probe.height()))
+        if probe.width() != IMG_W or probe.height() != IMG_H:
+            print("      ★ 和配置 %dx%d 不一致！VISION_CX/CY 要按实际出图改"
+                  % (IMG_W, IMG_H))
+        # ★ 关键一步：用这一帧试出"哪种送图方式能用"，之后每帧照抄
+        probe_display(probe)
+    else:
+        fatal("snapshot", "没有取到图像")
+
     print("=== %s ===" % VERSION)
+    print("  画面 %dx%d（16:9 全视野），图像中心 = (%d,%d)"
+          % (IMG_W, IMG_H, IMG_CX, IMG_CY))
+    print("  ★ F103 必须同步：VISION_CX/CY = %d/%d，VISION_TARGET_X/Y 重新标定，"
+          "VISION_MM_PER_60PX ≈ 37" % (IMG_CX, IMG_CY))
     print("  等主控发 circle / linear / stop")
     print("  串口在跑的时候，IDE 里会打印 [cmd] 和每一帧回包，这就是 K230 看到的东西")
 
@@ -637,9 +909,20 @@ def main():
     last_reply = "-"
     th_list = thresh_candidates()
 
+    # 自己算 fps（不用 time.clock()：有些固件会打 "deprecated function" 警告）
+    fps_t = time.ticks_ms()
+    fps_n = 0
+    fps = 0.0
+
     while True:
         exitpoint()                     # 让 IDE 的停止按钮能生效
-        clock.tick()
+
+        fps_n += 1
+        if time.ticks_diff(time.ticks_ms(), fps_t) >= 500:
+            fps = fps_n * 1000.0 / time.ticks_diff(time.ticks_ms(), fps_t)
+            fps_n = 0
+            fps_t = time.ticks_ms()
+
         img = sensor.snapshot()
 
         # ---------- 1) 收命令 ----------
@@ -778,7 +1061,7 @@ def main():
                 except Exception:
                     pass
                 last_reply = reply
-            print("[%s] %s  %s" % (mode, reply, info))
+            print("[%s] %s  %s  fps=%.1f" % (mode, reply, info, fps))
 
         # ---------- 5) 画面（屏 + IDE 帧缓冲）----------
         draw_label(img, 0, 0, "%s  %s" % (mode.upper(), last_reply),
